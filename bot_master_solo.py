@@ -14,7 +14,7 @@ ACCOUNT_ID = os.getenv("VK_ACCOUNT_ID")
 
 BASE_URL_V3 = "https://ads.vk.com/api/v3"
 BASE_URL_V2 = "https://ads.vk.com/api/v2"
-DOWNLOAD_DIR = "/opt/bot/master/downloads"
+DOWNLOAD_DIR = "/opt/bot/master"
 
 # === Логирование ===
 logging.basicConfig(
