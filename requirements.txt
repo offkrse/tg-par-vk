@@ -1,5 +1,4 @@
 telethon
-python-dotenv
 requests
 pandas
 boto3
