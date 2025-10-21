@@ -29,7 +29,7 @@ BASE_NUMBER = 53
 
 # === Логирование ===
 logging.basicConfig(
-    filename="/opt/bot/master/bot_master.log",
+    filename="/opt/bot/bot_master.log",
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
