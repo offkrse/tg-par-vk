@@ -5,10 +5,12 @@ import random
 import pandas as pd
 import requests
 import boto3
+from dotenv import load_dotenv
 from datetime import datetime
 from telethon import TelegramClient
 from collections import defaultdict
 
+load_dotenv()
 # === Настройки ===
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
