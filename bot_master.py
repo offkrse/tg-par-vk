@@ -177,10 +177,15 @@ async def send_file(file_path: str):
             form = aiohttp.FormData()
             form.add_field("chat_id", CHAT_ID)
             form.add_field("document", f)
-            await session.post(
+            async with session.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
                 data=form
-            )
+            ) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    logging.error(f"❌ Ошибка Telegram API ({resp.status}): {text}")
+                else:
+                    logging.info(f"📨 Успешно отправлен {os.path.basename(file_path)} в Telegram")
 # === VK ADS upload ===
 def upload_user_list(file_path, list_name):
     url = f"{BASE_URL_V3}/remarketing/users_lists.json"
