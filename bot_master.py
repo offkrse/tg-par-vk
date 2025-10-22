@@ -5,6 +5,7 @@ import random
 import pandas as pd
 import requests
 import boto3
+import aiohttp
 from dotenv import load_dotenv
 from datetime import datetime
 from telethon import TelegramClient
@@ -24,6 +25,9 @@ S3_SECRET_KEY = os.getenv("S3_SECRET_KEY")
 
 VK_ACCESS_TOKEN = os.getenv("VK_ACCESS_TOKEN")
 VK_ACCOUNT_ID = os.getenv("VK_ACCOUNT_ID")
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # === Базовая дата и номер ===
 BASE_DATE = datetime(2025, 7, 14)
@@ -166,7 +170,17 @@ def process_csv_files(files):
 
     return txt_files
 
-
+async def send_file(file_path: str):
+    """Отправка файла в Telegram без текста"""
+    async with aiohttp.ClientSession() as session:
+        with open(file_path, "rb") as f:
+            form = aiohttp.FormData()
+            form.add_field("chat_id", CHAT_ID)
+            form.add_field("document", f)
+            await session.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+                data=form
+            )
 # === VK ADS upload ===
 def upload_user_list(file_path, list_name):
     url = f"{BASE_URL_V3}/remarketing/users_lists.json"
@@ -262,6 +276,14 @@ async def main():
 
     for txt in txt_files:
         upload_to_vk_ads(txt)
+
+    # === Отправка TXT файлов в Telegram ===
+    for txt in txt_files:
+        try:
+            await send_file(txt)
+            logging.info(f"📨 Отправлен в Telegram: {os.path.basename(txt)}")
+        except Exception as e:
+            logging.error(f"❌ Ошибка отправки {txt} в Telegram: {e}")
 
     # === Удаление ===
     for f in csv_files + txt_files:
