@@ -225,7 +225,7 @@ def create_segment_with_list(segment_name, list_id):
 def upload_to_vk_ads(file_path):
     file_name = os.path.basename(file_path)
     list_name = os.path.splitext(file_name)[0]
-    segment_name = f"Аудитория_{list_name}"
+    segment_name = f"LAL {list_name}"
 
     try:
         list_id = upload_user_list(file_path, list_name)
