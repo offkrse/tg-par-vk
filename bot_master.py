@@ -88,7 +88,7 @@ async def download_latest_csv():
     os.makedirs("csv", exist_ok=True)
     result_files = []
 
-    async for msg in client.iter_messages(CHANNEL_NAME, limit=20):
+    async for msg in client.iter_messages(CHANNEL_NAME, limit=6):
         if msg.file and msg.file.name and msg.file.name.endswith(".csv"):
             filename = msg.file.name.replace(".csv", f" {date_suffix}.csv")
             path = os.path.join("csv", filename)
