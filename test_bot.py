@@ -27,7 +27,7 @@ S3_SECRET_KEY = os.getenv("S3_SECRET_KEY")
 
 # поддержка нескольких токенов через CSV-вход в .env
 # VK_ACCESS_TOKENS = token1,token2,token3
-VK_ACCESS_TOKENS = [t.strip() for t in os.getenv("VK_ACCESS_TOKENS", "").split(",") if t.strip()]
+VK_ACCESS_TOKENS = [t.strip() for t in os.getenv("VK_ACCESS_TOKEN", "").split(",") if t.strip()]
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
