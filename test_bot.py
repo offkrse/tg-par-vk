@@ -396,26 +396,41 @@ async def upload_to_all_vk_and_get_one_sharing_key(file_path, vk_tokens):
     """
     Загружает файл в каждый VK кабинет из vk_tokens.
     Возвращает (first_success_list_id, first_token) для генерации единого sharing key.
+    Добавлено подробное логирование.
     """
     file_name = os.path.basename(file_path)
     list_name = os.path.splitext(file_name)[0]
     segment_name = f"LAL {list_name}"
 
-    first_success = None  # tuple (list_id, token)
+    logging.info(f"📤 [VK_ALL_UPLOAD] Начинаем загрузку {file_name} в {len(vk_tokens)} кабинет(ов) VK")
+
+    first_success = None
     for token in vk_tokens:
+        short_token = token[:10] + "..."  # не показываем весь токен
         try:
+            logging.info(f"➡️ [VK_ALL_UPLOAD] Пробуем загрузить {file_name} с токеном {short_token}")
             list_id = upload_user_list_vk(file_path, list_name, token)
-            create_segment_vk(list_id, segment_name, token)
-            logging.info("VK upload OK for token (truncated): %s ... list_id=%s", token[:8], list_id)
-            # сохраняем первый успешный
+            logging.info(f"✅ [VK_ALL_UPLOAD] list_id={list_id} создан для {file_name} (token {short_token})")
+
+            seg_id = create_segment_vk(list_id, segment_name, token)
+            logging.info(f"✅ [VK_ALL_UPLOAD] segment_id={seg_id} создан для {file_name} (token {short_token})")
+
             if first_success is None:
                 first_success = (list_id, token)
+
         except Exception as e:
-            msg = f"Ошибка VK upload {file_name} для токена {token[:8]}: {e}"
+            msg = f"❌ [VK_ALL_UPLOAD] Ошибка VK upload {file_name} для токена {short_token}: {e}"
             logging.exception(msg)
             send_error_sync(msg)
-            # продолжаем на другие кабинеты
+            # продолжаем цикл — пробуем другие токены
+
+    if not first_success:
+        logging.warning(f"⚠️ [VK_ALL_UPLOAD] Не удалось загрузить {file_name} ни в один VK кабинет.")
+    else:
+        logging.info(f"🎯 [VK_ALL_UPLOAD] Первый успешный upload: list_id={first_success[0]}")
+
     return first_success
+
 
 
 def order_txt_files(files):
