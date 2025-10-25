@@ -68,10 +68,6 @@ def get_output_filename(file_name, day_number):
         return None, "6_web"
     elif any(name in file_name for name in ["253", "345"]):
         return f"Б1 ({day_number}).txt", "Б1"
-    elif "389" in file_name:
-        return f"Н1 ({day_number}).txt", "Н1"
-    elif "390" in file_name:
-        return f"Н2 ({day_number}).txt", "Н2"
     else:
         return None, None
 
@@ -88,7 +84,7 @@ async def download_latest_csv():
     os.makedirs("csv", exist_ok=True)
     result_files = []
 
-    async for msg in client.iter_messages(CHANNEL_NAME, limit=6):
+    async for msg in client.iter_messages(CHANNEL_NAME, limit=7):
         if msg.file and msg.file.name and msg.file.name.endswith(".csv"):
             filename = msg.file.name.replace(".csv", f" {date_suffix}.csv")
             path = os.path.join("csv", filename)
