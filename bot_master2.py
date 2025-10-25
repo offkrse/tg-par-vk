@@ -131,6 +131,10 @@ async def download_latest_csv(to_folder="/opt/bot/csv"):
             try:
                 if msg.file and msg.file.name and msg.file.name.endswith(".csv"):
                     orig_name = msg.file.name
+                    #ДЛЯ ОТМЕНЫ ПРАВИЛА 389 и 390 УБРАТЬ 3 следующие строчки
+                    if orig_name in ("389.csv", "390.csv"):
+                        logging.info("Пропускаем файл по имени: %s", orig_name)
+                        continue
                     if orig_name in seen_names:
                         logging.info("Пропускаем дубликат по имени: %s", orig_name)
                         continue
