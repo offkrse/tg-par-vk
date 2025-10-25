@@ -525,19 +525,20 @@ async def main():
     # 6) Загружаем каждый TXT в каждый VK кабинет, в порядке; собираем первый success для генерации sharing key
     first_success = first_success_for_key  # prefer leads_sub6 first_success if returned
     for txt in txt_files_ordered:
-    logging.info(f"🚀 Начинаем обработку TXT: {txt}")
-    await send_file_to_telegram(txt)
+        logging.info(f"🚀 Начинаем обработку TXT: {txt}")
+        await send_file_to_telegram(txt)
 
-    try:
-        res = await upload_to_all_vk_and_get_one_sharing_key(txt, VK_ACCESS_TOKENS)
-        if res and first_success is None:
-            first_success = res
-        logging.info(f"✅ VK загрузка завершена для {txt}, результат: {res}")
-    except Exception as e:
-        logging.exception(f"❌ Ошибка при загрузке {txt} в VK: {e}")
-        await send_error_async(f"Ошибка VK upload для {os.path.basename(txt)}: {e}")
+        try:
+            res = await upload_to_all_vk_and_get_one_sharing_key(txt, VK_ACCESS_TOKENS)
+            if res and first_success is None:
+                first_success = res
+            logging.info(f"✅ VK загрузка завершена для {txt}, результат: {res}")
+        except Exception as e:
+            logging.exception(f"❌ Ошибка при загрузке {txt} в VK: {e}")
+            await send_error_async(f"Ошибка VK upload для {os.path.basename(txt)}: {e}")
 
-    await asyncio.sleep(random.uniform(0.5, 1.5))
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+
 
 
 
