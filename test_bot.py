@@ -309,25 +309,50 @@ def upload_to_s3(file_path):
 
 
 def upload_user_list_vk(file_path, list_name, vk_token):
-    """Загружает список в конкретный VK кабинет (token). Возвращает list_id."""
+    """
+    Загружает список в конкретный VK кабинет (token).
+    Возвращает list_id или выбрасывает Exception.
+    Добавлено расширенное логирование.
+    """
     url = f"{BASE_URL_V3}/remarketing/users_lists.json"
     headers = {"Authorization": f"Bearer {vk_token}"}
     files = {"file": open(file_path, "rb")}
     data = {"name": list_name, "type": "phones"}
+
+    logging.info(f"📤 [VK_UPLOAD] Начало загрузки {file_path} -> {url}")
+    logging.info(f"  list_name={list_name}")
+    logging.info(f"  headers={headers}")
+    logging.info(f"  data={data}")
+
     try:
         resp = requests.post(url, headers=headers, files=files, data=data, timeout=60)
+    except Exception as e:
+        logging.exception(f"🚫 [VK_UPLOAD] Ошибка сети при загрузке {file_path}: {e}")
+        raise
+
     finally:
         files["file"].close()
+
     try:
         result = resp.json()
     except Exception:
+        logging.error(f"🚫 [VK_UPLOAD] Некорректный JSON ответ VK: {resp.text}")
         raise Exception(f"Некорректный ответ VK: {resp.text}")
+
+    # Подробный лог VK-ответа
+    logging.info(f"📩 [VK_UPLOAD] Ответ VK status={resp.status_code}: {result}")
+
     if resp.status_code != 200 or isinstance(result.get("error"), dict):
-        raise Exception(f"Ошибка загрузки списка: {result}")
+        err_text = result.get("error_description") or str(result)
+        raise Exception(f"Ошибка загрузки списка (HTTP {resp.status_code}): {err_text}")
+
     list_id = result.get("id")
     if not list_id:
-        raise Exception(f"Не удалось получить ID списка: {result}")
+        raise Exception(f"Не удалось получить ID списка из ответа VK: {result}")
+
+    logging.info(f"✅ [VK_UPLOAD] Файл {file_path} успешно загружен, list_id={list_id}")
     return list_id
+
 
 
 def create_segment_vk(list_id, segment_name, vk_token):
@@ -500,14 +525,21 @@ async def main():
     # 6) Загружаем каждый TXT в каждый VK кабинет, в порядке; собираем первый success для генерации sharing key
     first_success = first_success_for_key  # prefer leads_sub6 first_success if returned
     for txt in txt_files_ordered:
-        # отправляем файл в основной Telegram (по требованию)
-        await send_file_to_telegram(txt)
-        # загружаем в VK по каждому кабинету
+    logging.info(f"🚀 Начинаем обработку TXT: {txt}")
+    await send_file_to_telegram(txt)
+
+    try:
         res = await upload_to_all_vk_and_get_one_sharing_key(txt, VK_ACCESS_TOKENS)
         if res and first_success is None:
             first_success = res
-        # небольшая пауза
-        await asyncio.sleep(random.uniform(0.5, 1.5))
+        logging.info(f"✅ VK загрузка завершена для {txt}, результат: {res}")
+    except Exception as e:
+        logging.exception(f"❌ Ошибка при загрузке {txt} в VK: {e}")
+        await send_error_async(f"Ошибка VK upload для {os.path.basename(txt)}: {e}")
+
+    await asyncio.sleep(random.uniform(0.5, 1.5))
+
+
 
     # 7) После загрузки ВСЕХ файлов — генерируем один общий sharing key и отправляем ссылку в основной бот
     if first_success:
