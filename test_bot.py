@@ -17,7 +17,7 @@ S3_ENDPOINT = os.getenv("S3_ENDPOINT")
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY")
 
-VK_ACCESS_TOKEN = os.getenv("VK_ACCESS_TOKEN")
+VK_TOKENS = os.getenv("VK_ACCESS_TOKEN").split(",")  # поддержка нескольких токенов через запятую
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -34,6 +34,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
+# === S3 клиент ===
 s3 = boto3.client(
     "s3",
     endpoint_url=S3_ENDPOINT,
@@ -47,7 +48,6 @@ BASE_URL_V2 = "https://ads.vk.com/api/v2"
 
 # === Утилиты ===
 async def send_error(message: str):
-    """Отправка ошибки error-ботом"""
     if not ERROR_BOT_TOKEN or not ERROR_CHAT_ID:
         return
     async with aiohttp.ClientSession() as session:
@@ -58,8 +58,7 @@ async def send_error(message: str):
 
 
 def get_day_number(today: datetime) -> int:
-    delta = (today - BASE_DATE).days
-    return BASE_NUMBER + delta
+    return BASE_NUMBER + (today - BASE_DATE).days
 
 
 def get_output_filename(file_name: str, day_number: int):
@@ -76,7 +75,6 @@ def get_output_filename(file_name: str, day_number: int):
 
 
 def broker_channel_group(cid: str, day_number: int) -> str:
-    """Определяет название TXT файла по channel_id"""
     cid = str(cid)
     mapping = {
         "КР ДОП_3": [915, 917, 918, 919],
@@ -87,7 +85,7 @@ def broker_channel_group(cid: str, day_number: int) -> str:
         "КР ДОП_6": [10141, 10240],
         "КР ДОП_7": [11682, 11729],
         "КР ДОП_8": [12873],
-        "КР ДОП_9": [16263],
+        "КР ДОП_9": [16263]
     }
     for name, ids in mapping.items():
         if cid.isdigit() and int(cid) in ids:
@@ -95,34 +93,21 @@ def broker_channel_group(cid: str, day_number: int) -> str:
     return f"КР ДОП_10 ({day_number}).txt"
 
 
-def download_csv_from_s3(download_dir="/opt/bot/csv"):
-    """Скачивает все CSV-файлы из корня S3"""
-    os.makedirs(download_dir, exist_ok=True)
-    try:
-        response = s3.list_objects_v2(Bucket=S3_BUCKET)
-        if "Contents" not in response:
-            logging.info("Нет файлов в корне S3.")
-            return []
+# === Работа с S3 ===
+def download_csv_from_s3():
+    os.makedirs("/opt/bot/csv", exist_ok=True)
+    objects = s3.list_objects_v2(Bucket=S3_BUCKET).get("Contents", [])
+    csv_files = []
 
-        downloaded = []
-        for obj in response["Contents"]:
-            key = obj["Key"]
-            if not key.lower().endswith(".csv"):
-                continue
-            local_path = os.path.join(download_dir, os.path.basename(key))
-            s3.download_file(S3_BUCKET, key, local_path)
-            downloaded.append(local_path)
-            logging.info(f"⬇️ Скачан {key} в {local_path}")
-
-        if not downloaded:
-            logging.warning("⚠️ В S3 не найдено CSV файлов.")
-        return downloaded
-
-    except Exception as e:
-        msg = f"Ошибка скачивания CSV из S3: {e}"
-        logging.error(msg)
-        asyncio.run(send_error(msg))
-        return []
+    for obj in objects:
+        key = obj["Key"]
+        if not key.lower().endswith(".csv"):
+            continue
+        local_path = os.path.join("/opt/bot/csv", os.path.basename(key))
+        s3.download_file(S3_BUCKET, key, local_path)
+        logging.info(f"✅ Скачан из S3: {key}")
+        csv_files.append(local_path)
+    return csv_files
 
 
 def process_csv_files(files):
@@ -181,11 +166,6 @@ def process_csv_files(files):
 
             else:
                 phones = [str(p).replace("+", "").strip() for p in df["phone"].dropna()]
-                if not phones:
-                    msg = f"⚠️ Нет номеров в {fname}"
-                    logging.warning(msg)
-                    asyncio.run(send_error(msg))
-                    continue
                 if output_name:
                     output_data[output_name].update(phones)
 
@@ -194,10 +174,23 @@ def process_csv_files(files):
             logging.error(msg)
             asyncio.run(send_error(msg))
 
-    os.makedirs("txt", exist_ok=True)
+    os.makedirs("/opt/bot/txt", exist_ok=True)
     txt_files = []
-    for name, phones in output_data.items():
-        path = os.path.join("txt", name)
+    # сортировка по фиксированному порядку
+    order = [
+        "leads_sub6",
+        "КР ДОП_10", "КР ДОП_9", "КР ДОП_8", "КР ДОП_7",
+        "КР ДОП_6", "КР ДОП_5", "КР ДОП_4", "КР ДОП_3",
+        "КР 2", "КР 1",
+        "ББ ДОП_3", "ББ ДОП_2", "ББ", "Б1", "Б0"
+    ]
+    def sort_key(name):
+        for idx, part in enumerate(order):
+            if part in name:
+                return idx
+        return 999
+    for name, phones in sorted(output_data.items(), key=lambda x: sort_key(x[0])):
+        path = os.path.join("/opt/bot/txt", name)
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(sorted(phones)))
         txt_files.append(path)
@@ -206,7 +199,6 @@ def process_csv_files(files):
 
 
 async def send_file(file_path: str):
-    """Отправка файла в Telegram"""
     async with aiohttp.ClientSession() as session:
         with open(file_path, "rb") as f:
             form = aiohttp.FormData()
@@ -222,21 +214,9 @@ async def send_file(file_path: str):
                     await send_error(msg)
 
 
-def upload_to_s3(file_path):
-    filename = os.path.basename(file_path)
-    folder = "txt" if filename.endswith(".txt") else "csv"
-    try:
-        s3.upload_file(file_path, S3_BUCKET, f"{folder}/{filename}")
-        logging.info(f"☁️ Загружен в S3: {folder}/{filename}")
-    except Exception as e:
-        msg = f"Ошибка загрузки {filename} в S3: {e}"
-        logging.error(msg)
-        asyncio.run(send_error(msg))
-
-
-def upload_user_list(file_path, list_name):
+def upload_user_list(file_path, list_name, vk_token):
     url = f"{BASE_URL_V3}/remarketing/users_lists.json"
-    headers = {"Authorization": f"Bearer {VK_ACCESS_TOKEN}"}
+    headers = {"Authorization": f"Bearer {vk_token}"}
     files = {"file": open(file_path, "rb")}
     data = {"name": list_name, "type": "phones"}
     resp = requests.post(url, headers=headers, files=files, data=data)
@@ -247,9 +227,9 @@ def upload_user_list(file_path, list_name):
     return result.get("id")
 
 
-def create_segment_with_list(segment_name, list_id):
+def create_segment_with_list(segment_name, list_id, vk_token):
     url = f"{BASE_URL_V2}/remarketing/segments.json"
-    headers = {"Authorization": f"Bearer {VK_ACCESS_TOKEN}"}
+    headers = {"Authorization": f"Bearer {vk_token}"}
     payload = {
         "name": segment_name,
         "pass_condition": 1,
@@ -264,9 +244,9 @@ def create_segment_with_list(segment_name, list_id):
     return result.get("id")
 
 
-def generate_sharing_key(object_type: str, object_id: int):
+def generate_sharing_key(object_type: str, object_id: int, vk_token: str):
     url = f"{BASE_URL_V2}/sharing_keys.json"
-    headers = {"Authorization": f"Bearer {VK_ACCESS_TOKEN}"}
+    headers = {"Authorization": f"Bearer {vk_token}"}
     payload = {
         "sources": [{"object_type": object_type, "object_id": object_id}],
         "users": [],
@@ -276,64 +256,73 @@ def generate_sharing_key(object_type: str, object_id: int):
     result = resp.json()
     if resp.status_code != 200 or "error" in result:
         raise Exception(result)
-    logging.info(f"🔑 Sharing key создан: {result}")
-    return result
+    return result.get("sharing_url")
 
 
 def upload_to_vk_ads(file_path):
     file_name = os.path.basename(file_path)
     list_name = os.path.splitext(file_name)[0]
     segment_name = f"LAL {list_name}"
+    for vk_token in VK_TOKENS:
+        try:
+            list_id = upload_user_list(file_path, list_name, vk_token)
+            create_segment_with_list(segment_name, list_id, vk_token)
+            logging.info(f"📤 {file_name} загружен в VK Ads (ID={list_id})")
+        except Exception as e:
+            msg = f"Ошибка VK upload {file_name}: {e}"
+            logging.error(msg)
+            asyncio.run(send_error(msg))
+    # общий sharing key для всех сегментов (берем первый токен)
     try:
-        list_id = upload_user_list(file_path, list_name)
-        create_segment_with_list(segment_name, list_id)
-        generate_sharing_key("users_list", list_id)
-        logging.info(f"📤 VK upload OK ({file_name}) ID={list_id}")
+        first_list_id = upload_user_list(file_path, list_name, VK_TOKENS[0])
+        sharing_url = generate_sharing_key("users_list", first_list_id, VK_TOKENS[0])
+        asyncio.run(send_file_to_main_bot(sharing_url))
     except Exception as e:
-        msg = f"Ошибка VK upload {file_name}: {e}"
+        msg = f"Ошибка генерации sharing key: {e}"
         logging.error(msg)
         asyncio.run(send_error(msg))
 
 
-async def process_previous_day_file():
-    yesterday = datetime.today() - timedelta(days=1)
-    file_path = f"/opt/leads_postback/data/leads_sub6_{yesterday.strftime('%d.%m.%Y')}.txt"
-    if not os.path.exists(file_path):
-        return
+async def send_file_to_main_bot(url: str):
+    """Отправка ссылки sharing key основному боту"""
+    async with aiohttp.ClientSession() as session:
+        await session.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": f"🔑 Sharing key: {url}"}
+        )
 
+
+def upload_to_s3(file_path):
+    filename = os.path.basename(file_path)
+    folder = "txt" if filename.endswith(".txt") else "csv"
     try:
-        await send_file(file_path)
-        upload_to_vk_ads(file_path)
-        upload_to_s3(file_path)
+        s3.upload_file(file_path, S3_BUCKET, f"{folder}/{filename}")
+        logging.info(f"☁️ Загружен в S3: {folder}/{filename}")
     except Exception as e:
-        msg = f"Ошибка обработки файла за вчера: {e}"
+        msg = f"Ошибка загрузки {filename} в S3: {e}"
         logging.error(msg)
-        await send_error(msg)
-
-    old_date = datetime.today() - timedelta(days=7)
-    old_path = f"/opt/leads_postback/data/leads_sub6_{old_date.strftime('%d.%m.%Y')}.txt"
-    if os.path.exists(old_path):
-        os.remove(old_path)
-        logging.info(f"🧹 Удален старый файл: {old_path}")
+        asyncio.run(send_error(msg))
 
 
-# === Главный процесс ===
 async def main():
-    logging.info("=== 🚀 bot_master (S3 DOWNLOAD MODE) ===")
-    await process_previous_day_file()
+    logging.info("=== 🚀 bot_master запущен ===")
 
-    csv_files = download_csv_from_s3("/opt/bot/csv")
+    # === Скачиваем CSV из S3 ===
+    csv_files = download_csv_from_s3()
     if not csv_files:
-        msg = "⚠️ CSV не найдены в S3"
+        msg = "⚠️ CSV файлы не найдены в S3"
         logging.warning(msg)
         await send_error(msg)
         return
 
+    # === Обработка CSV → TXT ===
     txt_files = process_csv_files(csv_files)
 
+    # === Загрузка в S3 ===
     for f in csv_files + txt_files:
         upload_to_s3(f)
 
+    # === VK Ads и Telegram ===
     for txt in txt_files:
         upload_to_vk_ads(txt)
         await send_file(txt)
