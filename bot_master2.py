@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from telethon import TelegramClient
 from collections import defaultdict
+import urllib.parse  # <-- для декодирования sharing_url
 
 load_dotenv()
 
@@ -61,14 +62,15 @@ BASE_URL_V2 = "https://ads.vk.com/api/v2"
 
 # === Утилиты ===
 def send_error_sync(message: str):
-    """Синхронная отправка ошибки error-ботом (используется в sync коде)."""
+    """Синхронная отправка ошибки error-ботом (используется в sync коде).
+       Отправка без звука (disable_notification)."""
     if not ERROR_BOT_TOKEN or not ERROR_CHAT_ID:
         logging.warning(f"ERROR BOT not configured, would send: {message}")
         return
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{ERROR_BOT_TOKEN}/sendMessage",
-            data={"chat_id": ERROR_CHAT_ID, "text": f"ERROR /bot_master.py : {message}"}
+            data={"chat_id": ERROR_CHAT_ID, "text": f"ERROR /bot_master.py : {message}", "disable_notification": True}
         )
         if resp.status_code != 200:
             logging.error(f"Не удалось отправить ошибку в error-bot: {resp.status_code} {resp.text}")
@@ -77,7 +79,8 @@ def send_error_sync(message: str):
 
 
 async def send_error_async(message: str):
-    """Асинхронная отправка ошибки (используется в async коде)."""
+    """Асинхронная отправка ошибки (используется в async коде).
+       Отправка без звука (disable_notification)."""
     if not ERROR_BOT_TOKEN or not ERROR_CHAT_ID:
         logging.warning(f"ERROR BOT not configured, would send: {message}")
         return
@@ -85,7 +88,7 @@ async def send_error_async(message: str):
         async with aiohttp.ClientSession() as session:
             await session.post(
                 f"https://api.telegram.org/bot{ERROR_BOT_TOKEN}/sendMessage",
-                data={"chat_id": ERROR_CHAT_ID, "text": f"ERROR /bot_master.py : {message}"}
+                data={"chat_id": ERROR_CHAT_ID, "text": f"ERROR /bot_master.py : {message}", "disable_notification": "true"}
             )
     except Exception:
         logging.exception("Ошибка при send_error_async")
@@ -112,55 +115,40 @@ def get_output_filename(file_name: str, day_number: int):
 
 
 async def download_latest_csv(to_folder="/opt/bot/csv"):
-    """
-    Скачивает CSV файлы из S3 в локальную папку to_folder.
-    Копирует только новые файлы, убирает дубликаты по имени.
-    """
+    """Скачивает CSV из Telegram в папку to_folder (убирает дубликаты по исходному имени файла)."""
     os.makedirs(to_folder, exist_ok=True)
-    logging.info("📥 Скачиваем CSV из S3 в %s", to_folder)
+    logging.info("📥 Подключаемся к Telegram и скачиваем CSV в %s", to_folder)
+    client = TelegramClient("session_master", API_ID, API_HASH)
+    await client.start(PHONE)
+
+    today = datetime.today()
+    date_suffix = today.strftime("(%d.%m)")
+    seen_names = set()
+    result_files = []
 
     try:
-        # Получаем список всех объектов в бакете /csv/
-        response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix="csv/")
-        contents = response.get("Contents", [])
-        if not contents:
-            logging.warning("⚠️ В S3 нет файлов в папке /csv/")
-            return []
+        async for msg in client.iter_messages(CHANNEL_NAME, limit=7):
+            try:
+                if msg.file and msg.file.name and msg.file.name.endswith(".csv"):
+                    orig_name = msg.file.name
+                    if orig_name in seen_names:
+                        logging.info("Пропускаем дубликат по имени: %s", orig_name)
+                        continue
+                    seen_names.add(orig_name)
 
-        # Берем последние 7 файлов по дате модификации
-        contents = sorted(contents, key=lambda x: x["LastModified"], reverse=True)[:7]
+                    filename = orig_name.replace(".csv", f" {date_suffix}.csv")
+                    path = os.path.join(to_folder, filename)
+                    await msg.download_media(file=path)
+                    result_files.append(path)
+                    logging.info("✅ Скачан %s", filename)
+                    await asyncio.sleep(random.uniform(1, 2))
+            except Exception as e:
+                logging.exception("Ошибка при скачивании одного сообщения")
+                await send_error_async(f"Ошибка при скачивании сообщения: {e}")
+    finally:
+        await client.disconnect()
 
-        seen_names = set()
-        result_files = []
-        today = datetime.today()
-        date_suffix = today.strftime("(%d.%m)")
-
-        for obj in contents:
-            key = obj["Key"]
-            if not key.endswith(".csv"):
-                continue
-            orig_name = os.path.basename(key)
-            if orig_name in seen_names:
-                logging.info("Пропускаем дубликат по имени: %s", orig_name)
-                continue
-            seen_names.add(orig_name)
-
-            # добавляем дату к названию файла
-            filename = orig_name.replace(".csv", f" {date_suffix}.csv")
-            local_path = os.path.join(to_folder, filename)
-
-            # скачиваем из S3
-            s3.download_file(S3_BUCKET, key, local_path)
-            result_files.append(local_path)
-            logging.info("✅ Скачан %s из S3", filename)
-
-        return result_files
-
-    except Exception as e:
-        msg = f"Ошибка при скачивании CSV из S3: {e}"
-        logging.exception(msg)
-        await send_error_async(msg)
-        return []
+    return result_files
 
 
 def broker_channel_group(cid: str, day_number: int) -> str:
@@ -271,7 +259,7 @@ def process_csv_files(files):
 
 
 async def send_file_to_telegram(file_path: str, chat_id: str = CHAT_ID):
-    """Отправка файла в Telegram (основной бот)."""
+    """Отправка файла в Telegram (основной бот). Отправка без звука (disable_notification)."""
     if not BOT_TOKEN or not chat_id:
         logging.warning("Telegram BOT_TOKEN or CHAT_ID not configured")
         return
@@ -281,6 +269,7 @@ async def send_file_to_telegram(file_path: str, chat_id: str = CHAT_ID):
                 form = aiohttp.FormData()
                 form.add_field("chat_id", chat_id)
                 form.add_field("document", f)
+                form.add_field("disable_notification", "true")
                 async with session.post(
                     f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument", data=form
                 ) as resp:
@@ -295,9 +284,13 @@ async def send_file_to_telegram(file_path: str, chat_id: str = CHAT_ID):
 
 
 def upload_to_s3(file_path):
-    """Загрузка в S3: txt -> /txt, csv -> /csv"""
+    """Загрузка в S3: txt -> /txt. CSV НЕ загружается (игнорируются)."""
     filename = os.path.basename(file_path)
-    folder = "txt" if filename.lower().endswith(".txt") else "csv"
+    # загружаем только .txt
+    if not filename.lower().endswith(".txt"):
+        logging.info("Пропускаем загрузку в S3 (не TXT): %s", filename)
+        return
+    folder = "txt"
     key = f"{folder}/{filename}"
     try:
         s3.upload_file(file_path, S3_BUCKET, key)
@@ -309,50 +302,25 @@ def upload_to_s3(file_path):
 
 
 def upload_user_list_vk(file_path, list_name, vk_token):
-    """
-    Загружает список в конкретный VK кабинет (token).
-    Возвращает list_id или выбрасывает Exception.
-    Добавлено расширенное логирование.
-    """
+    """Загружает список в конкретный VK кабинет (token). Возвращает list_id."""
     url = f"{BASE_URL_V3}/remarketing/users_lists.json"
     headers = {"Authorization": f"Bearer {vk_token}"}
     files = {"file": open(file_path, "rb")}
     data = {"name": list_name, "type": "phones"}
-
-    logging.info(f"📤 [VK_UPLOAD] Начало загрузки {file_path} -> {url}")
-    logging.info(f"  list_name={list_name}")
-    logging.info(f"  headers={headers}")
-    logging.info(f"  data={data}")
-
     try:
         resp = requests.post(url, headers=headers, files=files, data=data, timeout=60)
-    except Exception as e:
-        logging.exception(f"🚫 [VK_UPLOAD] Ошибка сети при загрузке {file_path}: {e}")
-        raise
-
     finally:
         files["file"].close()
-
     try:
         result = resp.json()
     except Exception:
-        logging.error(f"🚫 [VK_UPLOAD] Некорректный JSON ответ VK: {resp.text}")
         raise Exception(f"Некорректный ответ VK: {resp.text}")
-
-    # Подробный лог VK-ответа
-    logging.info(f"📩 [VK_UPLOAD] Ответ VK status={resp.status_code}: {result}")
-
     if resp.status_code != 200 or isinstance(result.get("error"), dict):
-        err_text = result.get("error_description") or str(result)
-        raise Exception(f"Ошибка загрузки списка (HTTP {resp.status_code}): {err_text}")
-
+        raise Exception(f"Ошибка загрузки списка: {result}")
     list_id = result.get("id")
     if not list_id:
-        raise Exception(f"Не удалось получить ID списка из ответа VK: {result}")
-
-    logging.info(f"✅ [VK_UPLOAD] Файл {file_path} успешно загружен, list_id={list_id}")
+        raise Exception(f"Не удалось получить ID списка: {result}")
     return list_id
-
 
 
 def create_segment_vk(list_id, segment_name, vk_token):
@@ -396,41 +364,26 @@ async def upload_to_all_vk_and_get_one_sharing_key(file_path, vk_tokens):
     """
     Загружает файл в каждый VK кабинет из vk_tokens.
     Возвращает (first_success_list_id, first_token) для генерации единого sharing key.
-    Добавлено подробное логирование.
     """
     file_name = os.path.basename(file_path)
     list_name = os.path.splitext(file_name)[0]
     segment_name = f"LAL {list_name}"
 
-    logging.info(f"📤 [VK_ALL_UPLOAD] Начинаем загрузку {file_name} в {len(vk_tokens)} кабинет(ов) VK")
-
-    first_success = None
+    first_success = None  # tuple (list_id, token)
     for token in vk_tokens:
-        short_token = token[:10] + "..."  # не показываем весь токен
         try:
-            logging.info(f"➡️ [VK_ALL_UPLOAD] Пробуем загрузить {file_name} с токеном {short_token}")
             list_id = upload_user_list_vk(file_path, list_name, token)
-            logging.info(f"✅ [VK_ALL_UPLOAD] list_id={list_id} создан для {file_name} (token {short_token})")
-
-            seg_id = create_segment_vk(list_id, segment_name, token)
-            logging.info(f"✅ [VK_ALL_UPLOAD] segment_id={seg_id} создан для {file_name} (token {short_token})")
-
+            create_segment_vk(list_id, segment_name, token)
+            logging.info("VK upload OK for token (truncated): %s ... list_id=%s", token[:8], list_id)
+            # сохраняем первый успешный
             if first_success is None:
                 first_success = (list_id, token)
-
         except Exception as e:
-            msg = f"❌ [VK_ALL_UPLOAD] Ошибка VK upload {file_name} для токена {short_token}: {e}"
+            msg = f"Ошибка VK upload {file_name} для токена {token[:8]}: {e}"
             logging.exception(msg)
             send_error_sync(msg)
-            # продолжаем цикл — пробуем другие токены
-
-    if not first_success:
-        logging.warning(f"⚠️ [VK_ALL_UPLOAD] Не удалось загрузить {file_name} ни в один VK кабинет.")
-    else:
-        logging.info(f"🎯 [VK_ALL_UPLOAD] Первый успешный upload: list_id={first_success[0]}")
-
+            # продолжаем на другие кабинеты
     return first_success
-
 
 
 def order_txt_files(files):
@@ -477,7 +430,7 @@ async def process_previous_day_file():
         return
 
     try:
-        # отправляем в основной телеграм
+        # отправляем в основной телеграм (без звука)
         await send_file_to_telegram(file_path)
         # заливаем в VK в каждый кабинет (и собираем first_success для ключа)
         first_success = None
@@ -491,15 +444,23 @@ async def process_previous_day_file():
                 msg = f"Ошибка VK upload (leads_sub6) для токена {token[:8]}: {e}"
                 logging.exception(msg)
                 send_error_sync(msg)
-        # загрузка в S3
-        upload_to_s3(file_path)
-        logging.info("Обработан leads_sub6: %s", file_path)
         # при необходимости можно возвращать first_success
         return first_success
     except Exception as e:
         msg = f"Ошибка обработки leads_sub6: {e}"
         logging.exception(msg)
         await send_error_async(msg)
+
+
+def cleanup_files(files):
+    """Удаляет файлы из переданного списка, логируя ошибки, работает безопасно."""
+    for f in files:
+        try:
+            if os.path.exists(f):
+                os.remove(f)
+                logging.info("Удалён файл: %s", f)
+        except Exception:
+            logging.exception("Ошибка при удалении файла: %s", f)
 
 
 # === Главный процесс ===
@@ -516,6 +477,7 @@ async def main():
         msg = "CSV файлы не найдены в Telegram."
         logging.warning(msg)
         await send_error_async(msg)
+        # ничего не найдено — завершаем, но предварительно очищаем возможные пустые директории
         return
 
     # 3) Обрабатываем CSV -> TXT
@@ -524,10 +486,12 @@ async def main():
         msg = "Не получили TXT файлы после обработки CSV."
         logging.warning(msg)
         await send_error_async(msg)
+        # очистка csv, т.к. они уже скачаны и не нужны
+        cleanup_files(csv_files)
         return
 
-    # 4) Убедимся, что все файлы загружены в S3 (csv + txt)
-    for f in csv_files + txt_files:
+    # 4) Убедимся, что все TXT файлы загружены в S3 (только TXT — CSV НЕ загружаем)
+    for f in txt_files:
         try:
             upload_to_s3(f)
         except Exception as e:
@@ -540,35 +504,29 @@ async def main():
     # 6) Загружаем каждый TXT в каждый VK кабинет, в порядке; собираем первый success для генерации sharing key
     first_success = first_success_for_key  # prefer leads_sub6 first_success if returned
     for txt in txt_files_ordered:
-        logging.info(f"🚀 Начинаем обработку TXT: {txt}")
+        # отправляем файл в основной Telegram (по требованию), без звука
         await send_file_to_telegram(txt)
-
-        try:
-            res = await upload_to_all_vk_and_get_one_sharing_key(txt, VK_ACCESS_TOKENS)
-            if res and first_success is None:
-                first_success = res
-            logging.info(f"✅ VK загрузка завершена для {txt}, результат: {res}")
-        except Exception as e:
-            logging.exception(f"❌ Ошибка при загрузке {txt} в VK: {e}")
-            await send_error_async(f"Ошибка VK upload для {os.path.basename(txt)}: {e}")
-
+        # загружаем в VK по каждому кабинету
+        res = await upload_to_all_vk_and_get_one_sharing_key(txt, VK_ACCESS_TOKENS)
+        if res and first_success is None:
+            first_success = res
+        # небольшая пауза
         await asyncio.sleep(random.uniform(0.5, 1.5))
-
-
-
 
     # 7) После загрузки ВСЕХ файлов — генерируем один общий sharing key и отправляем ссылку в основной бот
     if first_success:
         try:
             list_id_for_key, token_for_key = first_success
             sharing_key, sharing_url = generate_sharing_key_for_owner("users_list", int(list_id_for_key), token_for_key)
-            # Отправляем ссылку в основной бот (BOT_TOKEN)
-            if BOT_TOKEN and CHAT_ID:
+            # декодируем URL (убираем %-encoding) и отправляем **только** декодированную ссылку без доп надписей
+            decoded_url = urllib.parse.unquote(sharing_url) if sharing_url else None
+            if BOT_TOKEN and CHAT_ID and decoded_url:
                 try:
                     resp = requests.post(
                         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                         data={"chat_id": CHAT_ID,
-                              "text": f"✅ Sharing key создан:\n{sharing_url}"}
+                              "text": f"{decoded_url}",
+                              "disable_notification": True}
                     )
                     if resp.status_code != 200:
                         logging.error("Не удалось отправить sharing key в основной бот: %s", resp.text)
@@ -577,15 +535,22 @@ async def main():
                     logging.exception("Ошибка отправки sharing key в основной бот")
                     send_error_sync(f"Ошибка отправки sharing key в основной бот: {e}")
             else:
-                logging.warning("BOT_TOKEN/CHAT_ID не настроены, sharing_url: %s", sharing_url)
-                send_error_sync(f"Sharing key: {sharing_url}")
-            logging.info("Sharing key создан и отправлен: %s", sharing_url)
+                logging.warning("BOT_TOKEN/CHAT_ID не настроены или decoded_url пустой, sharing_url: %s", sharing_url)
+                send_error_sync(f"Sharing key: {decoded_url or sharing_url}")
+            logging.info("Sharing key создан и отправлен: %s", decoded_url or sharing_url)
         except Exception as e:
             logging.exception("Ошибка при создании sharing key")
             send_error_sync(f"Ошибка при создании sharing key: {e}")
     else:
         logging.warning("Не найден ни один успешный list_id для генерации sharing key.")
         send_error_sync("Не найден ни один успешный list_id для генерации sharing key.")
+
+    # 8) Очистка: удаляем скачанные CSV и сгенерированные TXT из /opt/bot/csv и /opt/bot/txt
+    try:
+        cleanup_files(csv_files)
+        cleanup_files(txt_files)
+    except Exception:
+        logging.exception("Ошибка при финальной очистке файлов")
 
     logging.info("✅ Все задачи завершены.")
 
