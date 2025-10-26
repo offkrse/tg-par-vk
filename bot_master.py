@@ -11,7 +11,6 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from telethon import TelegramClient
 from collections import defaultdict
-import urllib.parse  # <-- для декодирования sharing_url
 
 load_dotenv()
 
@@ -345,25 +344,6 @@ def create_segment_vk(list_id, segment_name, vk_token):
     return result.get("id")
 
 
-def generate_sharing_key_for_owner(object_type: str, object_id: int, vk_token):
-    """Генерирует sharing key (для владельца) используя переданный токен."""
-    url = f"{BASE_URL_V2}/sharing_keys.json"
-    headers = {"Authorization": f"Bearer {vk_token}", "Content-Type": "application/json"}
-    payload = {
-        "sources": [{"object_type": object_type, "object_id": object_id}],
-        "users": [],
-        "send_email": False,
-    }
-    resp = requests.post(url, headers=headers, json=payload, timeout=60)
-    try:
-        result = resp.json()
-    except Exception:
-        raise Exception(f"Некорректный ответ sharing_keys: {resp.text}")
-    if resp.status_code != 200 or isinstance(result.get("error"), dict):
-        raise Exception(f"Ошибка при создании sharing key: {result}")
-    return result.get("sharing_key"), result.get("sharing_url")
-
-
 async def upload_to_all_vk_and_get_one_sharing_key(file_path, vk_tokens):
     """
     Загружает файл в каждый VK кабинет из vk_tokens.
@@ -517,39 +497,7 @@ async def main():
         # небольшая пауза
         await asyncio.sleep(random.uniform(0.5, 1.5))
 
-    # 7) После загрузки ВСЕХ файлов — генерируем один общий sharing key и отправляем ссылку в основной бот
-    if first_success:
-        try:
-            list_id_for_key, token_for_key = first_success
-            sharing_key, sharing_url = generate_sharing_key_for_owner("users_list", int(list_id_for_key), token_for_key)
-            # декодируем URL (убираем %-encoding) и отправляем **только** декодированную ссылку без доп надписей
-            decoded_url = urllib.parse.unquote(sharing_url) if sharing_url else None
-            if BOT_TOKEN and CHAT_ID and decoded_url:
-                try:
-                    resp = requests.post(
-                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                        data={"chat_id": CHAT_ID,
-                              "text": f"{decoded_url}",
-                              "disable_notification": True}
-                    )
-                    if resp.status_code != 200:
-                        logging.error("Не удалось отправить sharing key в основной бот: %s", resp.text)
-                        send_error_sync(f"Не удалось отправить sharing key в основной бот: {resp.status_code} {resp.text}")
-                except Exception as e:
-                    logging.exception("Ошибка отправки sharing key в основной бот")
-                    send_error_sync(f"Ошибка отправки sharing key в основной бот: {e}")
-            else:
-                logging.warning("BOT_TOKEN/CHAT_ID не настроены или decoded_url пустой, sharing_url: %s", sharing_url)
-                send_error_sync(f"Sharing key: {decoded_url or sharing_url}")
-            logging.info("Sharing key создан и отправлен: %s", decoded_url or sharing_url)
-        except Exception as e:
-            logging.exception("Ошибка при создании sharing key")
-            send_error_sync(f"Ошибка при создании sharing key: {e}")
-    else:
-        logging.warning("Не найден ни один успешный list_id для генерации sharing key.")
-        send_error_sync("Не найден ни один успешный list_id для генерации sharing key.")
-
-    # 8) Очистка: удаляем скачанные CSV и сгенерированные TXT из /opt/bot/csv и /opt/bot/txt
+    # 7) Очистка: удаляем скачанные CSV и сгенерированные TXT из /opt/bot/csv и /opt/bot/txt
     try:
         cleanup_files(csv_files)
         cleanup_files(txt_files)
