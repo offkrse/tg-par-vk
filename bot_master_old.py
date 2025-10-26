@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from telethon import TelegramClient
 from collections import defaultdict
+import urllib.parse  # <-- для декодирования sharing_url
 
 load_dotenv()
 
@@ -61,14 +62,15 @@ BASE_URL_V2 = "https://ads.vk.com/api/v2"
 
 # === Утилиты ===
 def send_error_sync(message: str):
-    """Синхронная отправка ошибки error-ботом (используется в sync коде)."""
+    """Синхронная отправка ошибки error-ботом (используется в sync коде).
+       Отправка без звука (disable_notification)."""
     if not ERROR_BOT_TOKEN or not ERROR_CHAT_ID:
         logging.warning(f"ERROR BOT not configured, would send: {message}")
         return
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{ERROR_BOT_TOKEN}/sendMessage",
-            data={"chat_id": ERROR_CHAT_ID, "text": f"ERROR /bot_master.py : {message}"}
+            data={"chat_id": ERROR_CHAT_ID, "text": f"ERROR /bot_master.py : {message}", "disable_notification": True}
         )
         if resp.status_code != 200:
             logging.error(f"Не удалось отправить ошибку в error-bot: {resp.status_code} {resp.text}")
@@ -77,7 +79,8 @@ def send_error_sync(message: str):
 
 
 async def send_error_async(message: str):
-    """Асинхронная отправка ошибки (используется в async коде)."""
+    """Асинхронная отправка ошибки (используется в async коде).
+       Отправка без звука (disable_notification)."""
     if not ERROR_BOT_TOKEN or not ERROR_CHAT_ID:
         logging.warning(f"ERROR BOT not configured, would send: {message}")
         return
@@ -85,7 +88,7 @@ async def send_error_async(message: str):
         async with aiohttp.ClientSession() as session:
             await session.post(
                 f"https://api.telegram.org/bot{ERROR_BOT_TOKEN}/sendMessage",
-                data={"chat_id": ERROR_CHAT_ID, "text": f"ERROR /bot_master.py : {message}"}
+                data={"chat_id": ERROR_CHAT_ID, "text": f"ERROR /bot_master.py : {message}", "disable_notification": "true"}
             )
     except Exception:
         logging.exception("Ошибка при send_error_async")
@@ -128,6 +131,10 @@ async def download_latest_csv(to_folder="/opt/bot/csv"):
             try:
                 if msg.file and msg.file.name and msg.file.name.endswith(".csv"):
                     orig_name = msg.file.name
+                    #ДЛЯ ОТМЕНЫ ПРАВИЛА 389 и 390 УБРАТЬ 3 следующие строчки
+                    if orig_name in ("389.csv", "390.csv"):
+                        logging.info("Пропускаем файл по имени: %s", orig_name)
+                        continue
                     if orig_name in seen_names:
                         logging.info("Пропускаем дубликат по имени: %s", orig_name)
                         continue
@@ -256,7 +263,7 @@ def process_csv_files(files):
 
 
 async def send_file_to_telegram(file_path: str, chat_id: str = CHAT_ID):
-    """Отправка файла в Telegram (основной бот)."""
+    """Отправка файла в Telegram (основной бот). Отправка без звука (disable_notification)."""
     if not BOT_TOKEN or not chat_id:
         logging.warning("Telegram BOT_TOKEN or CHAT_ID not configured")
         return
@@ -266,6 +273,7 @@ async def send_file_to_telegram(file_path: str, chat_id: str = CHAT_ID):
                 form = aiohttp.FormData()
                 form.add_field("chat_id", chat_id)
                 form.add_field("document", f)
+                form.add_field("disable_notification", "true")
                 async with session.post(
                     f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument", data=form
                 ) as resp:
@@ -280,9 +288,13 @@ async def send_file_to_telegram(file_path: str, chat_id: str = CHAT_ID):
 
 
 def upload_to_s3(file_path):
-    """Загрузка в S3: txt -> /txt, csv -> /csv"""
+    """Загрузка в S3: txt -> /txt. CSV НЕ загружается (игнорируются)."""
     filename = os.path.basename(file_path)
-    folder = "txt" if filename.lower().endswith(".txt") else "csv"
+    # загружаем только .txt
+    if not filename.lower().endswith(".txt"):
+        logging.info("Пропускаем загрузку в S3 (не TXT): %s", filename)
+        return
+    folder = "txt"
     key = f"{folder}/{filename}"
     try:
         s3.upload_file(file_path, S3_BUCKET, key)
@@ -422,7 +434,7 @@ async def process_previous_day_file():
         return
 
     try:
-        # отправляем в основной телеграм
+        # отправляем в основной телеграм (без звука)
         await send_file_to_telegram(file_path)
         # заливаем в VK в каждый кабинет (и собираем first_success для ключа)
         first_success = None
@@ -436,15 +448,23 @@ async def process_previous_day_file():
                 msg = f"Ошибка VK upload (leads_sub6) для токена {token[:8]}: {e}"
                 logging.exception(msg)
                 send_error_sync(msg)
-        # загрузка в S3
-        upload_to_s3(file_path)
-        logging.info("Обработан leads_sub6: %s", file_path)
         # при необходимости можно возвращать first_success
         return first_success
     except Exception as e:
         msg = f"Ошибка обработки leads_sub6: {e}"
         logging.exception(msg)
         await send_error_async(msg)
+
+
+def cleanup_files(files):
+    """Удаляет файлы из переданного списка, логируя ошибки, работает безопасно."""
+    for f in files:
+        try:
+            if os.path.exists(f):
+                os.remove(f)
+                logging.info("Удалён файл: %s", f)
+        except Exception:
+            logging.exception("Ошибка при удалении файла: %s", f)
 
 
 # === Главный процесс ===
@@ -461,6 +481,7 @@ async def main():
         msg = "CSV файлы не найдены в Telegram."
         logging.warning(msg)
         await send_error_async(msg)
+        # ничего не найдено — завершаем, но предварительно очищаем возможные пустые директории
         return
 
     # 3) Обрабатываем CSV -> TXT
@@ -469,10 +490,12 @@ async def main():
         msg = "Не получили TXT файлы после обработки CSV."
         logging.warning(msg)
         await send_error_async(msg)
+        # очистка csv, т.к. они уже скачаны и не нужны
+        cleanup_files(csv_files)
         return
 
-    # 4) Убедимся, что все файлы загружены в S3 (csv + txt)
-    for f in csv_files + txt_files:
+    # 4) Убедимся, что все TXT файлы загружены в S3 (только TXT — CSV НЕ загружаем)
+    for f in txt_files:
         try:
             upload_to_s3(f)
         except Exception as e:
@@ -485,7 +508,7 @@ async def main():
     # 6) Загружаем каждый TXT в каждый VK кабинет, в порядке; собираем первый success для генерации sharing key
     first_success = first_success_for_key  # prefer leads_sub6 first_success if returned
     for txt in txt_files_ordered:
-        # отправляем файл в основной Telegram (по требованию)
+        # отправляем файл в основной Telegram (по требованию), без звука
         await send_file_to_telegram(txt)
         # загружаем в VK по каждому кабинету
         res = await upload_to_all_vk_and_get_one_sharing_key(txt, VK_ACCESS_TOKENS)
@@ -499,13 +522,15 @@ async def main():
         try:
             list_id_for_key, token_for_key = first_success
             sharing_key, sharing_url = generate_sharing_key_for_owner("users_list", int(list_id_for_key), token_for_key)
-            # Отправляем ссылку в основной бот (BOT_TOKEN)
-            if BOT_TOKEN and CHAT_ID:
+            # декодируем URL (убираем %-encoding) и отправляем **только** декодированную ссылку без доп надписей
+            decoded_url = urllib.parse.unquote(sharing_url) if sharing_url else None
+            if BOT_TOKEN and CHAT_ID and decoded_url:
                 try:
                     resp = requests.post(
                         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                         data={"chat_id": CHAT_ID,
-                              "text": f"✅ Sharing key создан:\n{sharing_url}"}
+                              "text": f"{decoded_url}",
+                              "disable_notification": True}
                     )
                     if resp.status_code != 200:
                         logging.error("Не удалось отправить sharing key в основной бот: %s", resp.text)
@@ -514,15 +539,22 @@ async def main():
                     logging.exception("Ошибка отправки sharing key в основной бот")
                     send_error_sync(f"Ошибка отправки sharing key в основной бот: {e}")
             else:
-                logging.warning("BOT_TOKEN/CHAT_ID не настроены, sharing_url: %s", sharing_url)
-                send_error_sync(f"Sharing key: {sharing_url}")
-            logging.info("Sharing key создан и отправлен: %s", sharing_url)
+                logging.warning("BOT_TOKEN/CHAT_ID не настроены или decoded_url пустой, sharing_url: %s", sharing_url)
+                send_error_sync(f"Sharing key: {decoded_url or sharing_url}")
+            logging.info("Sharing key создан и отправлен: %s", decoded_url or sharing_url)
         except Exception as e:
             logging.exception("Ошибка при создании sharing key")
             send_error_sync(f"Ошибка при создании sharing key: {e}")
     else:
         logging.warning("Не найден ни один успешный list_id для генерации sharing key.")
         send_error_sync("Не найден ни один успешный list_id для генерации sharing key.")
+
+    # 8) Очистка: удаляем скачанные CSV и сгенерированные TXT из /opt/bot/csv и /opt/bot/txt
+    try:
+        cleanup_files(csv_files)
+        cleanup_files(txt_files)
+    except Exception:
+        logging.exception("Ошибка при финальной очистке файлов")
 
     logging.info("✅ Все задачи завершены.")
 
