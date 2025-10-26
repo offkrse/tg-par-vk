@@ -304,12 +304,12 @@ def upload_to_s3(file_path):
         send_error_sync(msg)
 
 
-def upload_user_list_vk(file_path, list_name, vk_token):
+def upload_user_list_vk(file_path, list_name, vk_token, list_type="phones"):
     """Загружает список в конкретный VK кабинет (token). Возвращает list_id."""
     url = f"{BASE_URL_V3}/remarketing/users_lists.json"
     headers = {"Authorization": f"Bearer {vk_token}"}
     files = {"file": open(file_path, "rb")}
-    data = {"name": list_name, "type": "phones"}
+    data = {"name": list_name, "type": list_type}
     try:
         resp = requests.post(url, headers=headers, files=files, data=data, timeout=60)
     finally:
@@ -420,8 +420,8 @@ async def process_previous_day_file():
         first_success = None
         for token in VK_ACCESS_TOKENS:
             try:
-                list_id = upload_user_list_vk(file_path, f"leads_sub6_{yesterday.strftime('%d.%m.%Y')}", token)
-                create_segment_vk(list_id, f"LAL leads_sub6_{yesterday.strftime('%d.%m.%Y')}", token)
+                list_id = upload_user_list_vk(file_path, f"ls6_{yesterday.strftime('%d.%m.%Y')}", token, list_type="vk")
+                create_segment_vk(list_id, f"LAL ls6_{yesterday.strftime('%d.%m.%Y')}", token)
                 if first_success is None:
                     first_success = (list_id, token)
             except Exception as e:
