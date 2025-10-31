@@ -115,6 +115,7 @@ def get_output_filename(file_name: str, day_number: int):
 
 async def download_latest_csv(to_folder="/opt/bot/csv"):
     """Скачивает CSV из Telegram в папку to_folder (убирает дубликаты по исходному имени файла)."""
+    await asyncio.sleep(random.uniform(5, 10))
     os.makedirs(to_folder, exist_ok=True)
     logging.info("📥 Подключаемся к Telegram и скачиваем CSV в %s", to_folder)
     client = TelegramClient("session_master", API_ID, API_HASH)
@@ -163,8 +164,7 @@ def broker_channel_group(cid: str, day_number: int) -> str:
         "КР 2": [11896],
         "КР ДОП_4": [3587, 7389, 7553, 8614, 8732],
         "КР ДОП_5": [9189, 9190, 9191, 9192, 9193, 9194, 9413, 9441, 9443, 9453, 9889, 9899],
-        "КР ДОП_6": [10141, 10240],
-        "КР ДОП_7": [11682, 11729],
+        "КР ДОП_6": [10141, 10240, 11682, 11729],
         "КР ДОП_8": [12873],
         "КР ДОП_9": [16263],
     }
@@ -312,6 +312,7 @@ def upload_user_list_vk(file_path, list_name, vk_token, list_type="phones"):
     data = {"name": list_name, "type": list_type}
     try:
         resp = requests.post(url, headers=headers, files=files, data=data, timeout=60)
+        time.sleep(3)
     finally:
         files["file"].close()
     try:
@@ -338,6 +339,7 @@ def create_segment_vk(list_id, segment_name, vk_token):
         ],
     }
     resp = requests.post(url, headers=headers, json=payload, timeout=60)
+    time.sleep(3)
     result = resp.json()
     if resp.status_code != 200 or isinstance(result.get("error"), dict):
         raise Exception(f"Ошибка создания сегмента: {result}")
@@ -366,6 +368,7 @@ async def upload_to_all_vk_and_get_one_sharing_key(file_path, vk_tokens):
             msg = f"Ошибка VK upload {file_name} для токена {token[:8]}: {e}"
             logging.exception(msg)
             send_error_sync(msg)
+        await asyncio.sleep(3)
             # продолжаем на другие кабинеты
     return first_success
 
