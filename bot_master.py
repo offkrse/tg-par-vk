@@ -7,6 +7,8 @@ import pandas as pd
 import requests
 import boto3
 import aiohttp
+import time
+from typing import Any, Dict, Optional
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from telethon import TelegramClient
@@ -57,6 +59,72 @@ s3 = boto3.client(
 # === VK API URLs ===
 BASE_URL_V3 = "https://ads.vk.com/api/v3"
 BASE_URL_V2 = "https://ads.vk.com/api/v2"
+
+MAX_UPLOADS_PER_TOKEN = 20  # максимум загрузок на один кабинет
+VK_UPLOAD_COUNTERS = {}
+
+# === HTTP с повторами и обработкой rate limit ===
+RETRY_COUNT = 3
+RETRY_BACKOFF = 2
+RATE_LIMIT_SLEEP = (10, 30)
+
+def req_with_retry(
+    method: str,
+    url: str,
+    headers: Dict[str, str],
+    params: Optional[Dict[str, Any]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
+    files: Optional[Dict[str, Any]] = None,
+    data: Optional[Dict[str, Any]] = None,
+    timeout: int = 60
+) -> requests.Response:
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, RETRY_COUNT + 1):
+        try:
+            resp = requests.request(
+                method, url,
+                headers=headers,
+                params=params,
+                json=json_body,
+                data=data,
+                files=files,
+                timeout=timeout
+            )
+
+            # === Обработка rate limit ===
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", "5"))
+                logger.warning(f"⚠️ VK API rate limit (429). Пауза {retry_after}s перед повтором...")
+                time.sleep(retry_after)
+                continue
+
+            try:
+                result = resp.json()
+                vk_error = result.get("error", {})
+                if isinstance(vk_error, dict) and vk_error.get("error_code") in (9, 29):
+                    sleep_for = random.uniform(*RATE_LIMIT_SLEEP)
+                    logger.warning(f"⚠️ VK flood control ({vk_error.get('error_code')}). "
+                                   f"Пауза {sleep_for:.1f}s перед повтором...")
+                    time.sleep(sleep_for)
+                    continue
+            except Exception:
+                pass
+
+            if resp.status_code >= 500:
+                raise requests.HTTPError(f"{resp.status_code} {resp.text}")
+
+            return resp
+
+        except Exception as e:
+            last_exc = e
+            sleep_for = RETRY_BACKOFF ** (attempt - 1)
+            logger.warning(f"{method} {url} попытка {attempt}/{RETRY_COUNT} не удалась: {e}. "
+                           f"Повтор через {sleep_for:.1f}s")
+            time.sleep(sleep_for)
+
+    assert last_exc is not None
+    raise last_exc
 
 
 # === Утилиты ===
@@ -115,7 +183,7 @@ def get_output_filename(file_name: str, day_number: int):
 
 async def download_latest_csv(to_folder="/opt/bot/csv"):
     """Скачивает CSV из Telegram в папку to_folder (убирает дубликаты по исходному имени файла)."""
-    await asyncio.sleep(random.uniform(5, 10))
+    await asyncio.sleep(random.uniform(2, 4))
     os.makedirs(to_folder, exist_ok=True)
     logging.info("📥 Подключаемся к Telegram и скачиваем CSV в %s", to_folder)
     client = TelegramClient("session_master", API_ID, API_HASH)
@@ -311,10 +379,10 @@ def upload_user_list_vk(file_path, list_name, vk_token, list_type="phones"):
     files = {"file": open(file_path, "rb")}
     data = {"name": list_name, "type": list_type}
     try:
-        resp = requests.post(url, headers=headers, files=files, data=data, timeout=60)
-        time.sleep(3)
+        resp = req_with_retry("POST", url, headers=headers, files=files, data=data, timeout=60)
     finally:
         files["file"].close()
+
     try:
         result = resp.json()
     except Exception:
@@ -338,13 +406,11 @@ def create_segment_vk(list_id, segment_name, vk_token):
             {"object_type": "remarketing_users_list", "params": {"source_id": list_id, "type": "positive"}}
         ],
     }
-    resp = requests.post(url, headers=headers, json=payload, timeout=60)
-    time.sleep(3)
+    resp = req_with_retry("POST", url, headers=headers, json_body=payload, timeout=60)
     result = resp.json()
     if resp.status_code != 200 or isinstance(result.get("error"), dict):
         raise Exception(f"Ошибка создания сегмента: {result}")
     return result.get("id")
-
 
 async def upload_to_all_vk_and_get_one_sharing_key(file_path, vk_tokens):
     """
@@ -357,6 +423,17 @@ async def upload_to_all_vk_and_get_one_sharing_key(file_path, vk_tokens):
 
     first_success = None  # tuple (list_id, token)
     for token in vk_tokens:
+        # Инициализируем счётчик, если его нет
+        if token not in VK_UPLOAD_COUNTERS:
+            VK_UPLOAD_COUNTERS[token] = 0
+
+        # 🔒 Проверяем лимит перед загрузкой
+        if VK_UPLOAD_COUNTERS[token] >= MAX_UPLOADS_PER_TOKEN:
+            logging.warning(
+                f"⚠️ Превышен лимит {MAX_UPLOADS_PER_TOKEN} загрузок для VK кабинета {token[:8]}... Пропускаем."
+            )
+            continue
+            
         try:
             list_id = upload_user_list_vk(file_path, list_name, token)
             create_segment_vk(list_id, segment_name, token)
@@ -368,7 +445,6 @@ async def upload_to_all_vk_and_get_one_sharing_key(file_path, vk_tokens):
             msg = f"Ошибка VK upload {file_name} для токена {token[:8]}: {e}"
             logging.exception(msg)
             send_error_sync(msg)
-        await asyncio.sleep(3)
             # продолжаем на другие кабинеты
     return first_success
 
@@ -497,8 +573,6 @@ async def main():
         res = await upload_to_all_vk_and_get_one_sharing_key(txt, VK_ACCESS_TOKENS)
         if res and first_success is None:
             first_success = res
-        # небольшая пауза
-        await asyncio.sleep(random.uniform(0.5, 1.5))
 
     # 7) Очистка: удаляем скачанные CSV и сгенерированные TXT из /opt/bot/csv и /opt/bot/txt
     try:
