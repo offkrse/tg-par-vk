@@ -412,41 +412,43 @@ def create_segment_vk(list_id, segment_name, vk_token):
         raise Exception(f"Ошибка создания сегмента: {result}")
     return result.get("id")
 
-async def upload_to_all_vk_and_get_one_sharing_key(file_path, vk_tokens):
+async def upload_to_all_vk_and_get_one_sharing_key(file_path, vk_tokens, *, list_name=None, list_type="phones", segment_prefix="LAL "):
     """
     Загружает файл в каждый VK кабинет из vk_tokens.
-    Возвращает (first_success_list_id, first_token) для генерации единого sharing key.
+    Возвращает (first_success_list_id, first_token) для генерации единого sharing key (если надо).
+    Позволяет явно задать list_name/list_type и префикс сегмента.
     """
     file_name = os.path.basename(file_path)
-    list_name = os.path.splitext(file_name)[0]
-    segment_name = f"LAL {list_name}"
+    base_list_name = os.path.splitext(file_name)[0]
+    list_name = list_name or base_list_name
+    segment_name = f"{segment_prefix}{list_name}"
 
     first_success = None  # tuple (list_id, token)
     for token in vk_tokens:
-        # Инициализируем счётчик, если его нет
         if token not in VK_UPLOAD_COUNTERS:
             VK_UPLOAD_COUNTERS[token] = 0
 
-        # 🔒 Проверяем лимит перед загрузкой
+        # 🔒 Проверка лимита
         if VK_UPLOAD_COUNTERS[token] >= MAX_UPLOADS_PER_TOKEN:
             logging.warning(
                 f"⚠️ Превышен лимит {MAX_UPLOADS_PER_TOKEN} загрузок для VK кабинета {token[:8]}... Пропускаем."
             )
             continue
-            
+
         try:
-            list_id = upload_user_list_vk(file_path, list_name, token)
+            list_id = upload_user_list_vk(file_path, list_name, token, list_type=list_type)
             create_segment_vk(list_id, segment_name, token)
+            VK_UPLOAD_COUNTERS[token] += 1  # ✅ инкремент при успехе
             logging.info("VK upload OK for token (truncated): %s ... list_id=%s", token[:8], list_id)
-            # сохраняем первый успешный
             if first_success is None:
                 first_success = (list_id, token)
         except Exception as e:
             msg = f"Ошибка VK upload {file_name} для токена {token[:8]}: {e}"
             logging.exception(msg)
             send_error_sync(msg)
-            # продолжаем на другие кабинеты
+
     return first_success
+
 
 
 def order_txt_files(files):
@@ -485,34 +487,27 @@ def order_txt_files(files):
 
 
 async def process_previous_day_file():
-    """Обрабатывает файл за вчерашний день: отправляет в Telegram, загружает в VK (все аккаунты) и в S3."""
+    """
+    Обрабатывает файл за вчерашний день:
+    - отправляет в Telegram,
+    - НЕ грузит в VK (это делаем позже общим проходом),
+    - возвращает путь к файлу (или None, если файла нет).
+    """
     yesterday = datetime.today() - timedelta(days=1)
     file_path = f"/opt/leads_postback/data/leads_sub6_{yesterday.strftime('%d.%m.%Y')}.txt"
     if not os.path.exists(file_path):
         logging.info("Файл leads_sub6 за вчера не найден: %s", file_path)
-        return
+        return None
 
     try:
-        # отправляем в основной телеграм (без звука)
-        await send_file_to_telegram(file_path)
-        # заливаем в VK в каждый кабинет (и собираем first_success для ключа)
-        first_success = None
-        for token in VK_ACCESS_TOKENS:
-            try:
-                list_id = upload_user_list_vk(file_path, f"ls6_{yesterday.strftime('%d.%m.%Y')}", token, list_type="vk")
-                create_segment_vk(list_id, f"LAL ls6_{yesterday.strftime('%d.%m.%Y')}", token)
-                if first_success is None:
-                    first_success = (list_id, token)
-            except Exception as e:
-                msg = f"Ошибка VK upload (leads_sub6) для токена {token[:8]}: {e}"
-                logging.exception(msg)
-                send_error_sync(msg)
-        # при необходимости можно возвращать first_success
-        return first_success
+        await send_file_to_telegram(file_path)  # только TG
+        return file_path
     except Exception as e:
         msg = f"Ошибка обработки leads_sub6: {e}"
         logging.exception(msg)
         await send_error_async(msg)
+        return None
+
 
 
 def cleanup_files(files):
@@ -530,9 +525,8 @@ def cleanup_files(files):
 async def main():
     logging.info("=== 🚀 Запуск bot_master ===")
 
-    # 1) Сначала обрабатываем файл leads_sub6 вчерашнего дня
-    first_success_for_key = await process_previous_day_file()
-    # first_success_for_key может быть None или (list_id, token)
+    # 1) Сначала обрабатываем файл leads_sub6 вчерашнего дня (Только TG, путь вернём для VK)
+    leads_sub6_path = await process_previous_day_file()
 
     # 2) Скачиваем CSV из Telegram в /opt/bot/csv
     csv_files = await download_latest_csv("/opt/bot/csv")
@@ -540,7 +534,6 @@ async def main():
         msg = "CSV файлы не найдены в Telegram."
         logging.warning(msg)
         await send_error_async(msg)
-        # ничего не найдено — завершаем, но предварительно очищаем возможные пустые директории
         return
 
     # 3) Обрабатываем CSV -> TXT
@@ -549,11 +542,10 @@ async def main():
         msg = "Не получили TXT файлы после обработки CSV."
         logging.warning(msg)
         await send_error_async(msg)
-        # очистка csv, т.к. они уже скачаны и не нужны
         cleanup_files(csv_files)
         return
 
-    # 4) Убедимся, что все TXT файлы загружены в S3 (только TXT — CSV НЕ загружаем)
+    # 4) Загрузка TXT в S3 (CSV не трогаем)
     for f in txt_files:
         try:
             upload_to_s3(f)
@@ -564,17 +556,53 @@ async def main():
     # 5) Сортируем TXT файлы по требуемому порядку
     txt_files_ordered = order_txt_files(txt_files)
 
-    # 6) Загружаем каждый TXT в каждый VK кабинет, в порядке; собираем первый success для генерации sharing key
-    first_success = first_success_for_key  # prefer leads_sub6 first_success if returned
-    for txt in txt_files_ordered:
-        # отправляем файл в основной Telegram (по требованию), без звука
-        await send_file_to_telegram(txt)
-        # загружаем в VK по каждому кабинету
-        res = await upload_to_all_vk_and_get_one_sharing_key(txt, VK_ACCESS_TOKENS)
-        if res and first_success is None:
-            first_success = res
+    # 6) Подготавливаем общий список файлов, которые надо:
+    #    - СНАЧАЛА отправить в TG (все)
+    #    - ПОТОМ загрузить в VK (все, тем же порядком)
+    files_pipeline = []
+    if leads_sub6_path and os.path.exists(leads_sub6_path):
+        files_pipeline.append(leads_sub6_path)
+    files_pipeline.extend(txt_files_ordered)
 
-    # 7) Очистка: удаляем скачанные CSV и сгенерированные TXT из /opt/bot/csv и /opt/bot/txt
+    # 7) ЭТАП 1 — сначала отправляем ВСЕ файлы в Telegram (без звука)
+    for path in files_pipeline:
+        try:
+            await send_file_to_telegram(path)
+        except Exception as e:
+            logging.exception("Ошибка отправки в Telegram")
+            await send_error_async(f"Ошибка при отправке файла в Telegram {path}: {e}")
+
+    # 8) ЭТАП 2 — затем загружаем ВСЕ файлы в VK ADS (каждый файл — во все кабинеты)
+    #    Для leads_sub6 нужен особый list_type/name, для остальных — по умолчанию.
+    first_success = None
+    for path in files_pipeline:
+        fname = os.path.basename(path)
+        try:
+            if fname.startswith("leads_sub6_"):
+                # Нейминг, как был раньше
+                date_part = fname.replace("leads_sub6_", "").replace(".txt", "")
+                custom_list_name = f"ls6_{date_part}"
+                res = await upload_to_all_vk_and_get_one_sharing_key(
+                    path, VK_ACCESS_TOKENS,
+                    list_name=custom_list_name,
+                    list_type="vk",
+                    segment_prefix="LAL "
+                )
+            else:
+                # Обычные TXT (типы телефонов)
+                res = await upload_to_all_vk_and_get_one_sharing_key(
+                    path, VK_ACCESS_TOKENS,
+                    list_name=None,
+                    list_type="phones",
+                    segment_prefix="LAL "
+                )
+            if res and first_success is None:
+                first_success = res
+        except Exception as e:
+            logging.exception("Ошибка VK загрузки")
+            send_error_sync(f"Ошибка VK загрузки {fname}: {e}")
+
+    # 9) Очистка временных файлов
     try:
         cleanup_files(csv_files)
         cleanup_files(txt_files)
@@ -582,6 +610,7 @@ async def main():
         logging.exception("Ошибка при финальной очистке файлов")
 
     logging.info("✅ Все задачи завершены.")
+
 
 
 if __name__ == "__main__":
