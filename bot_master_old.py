@@ -7,11 +7,12 @@ import pandas as pd
 import requests
 import boto3
 import aiohttp
+import time
+from typing import Any, Dict, Optional
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from telethon import TelegramClient
 from collections import defaultdict
-import urllib.parse  # <-- для декодирования sharing_url
 
 load_dotenv()
 
@@ -58,6 +59,72 @@ s3 = boto3.client(
 # === VK API URLs ===
 BASE_URL_V3 = "https://ads.vk.com/api/v3"
 BASE_URL_V2 = "https://ads.vk.com/api/v2"
+
+MAX_UPLOADS_PER_TOKEN = 20  # максимум загрузок на один кабинет
+VK_UPLOAD_COUNTERS = {}
+
+# === HTTP с повторами и обработкой rate limit ===
+RETRY_COUNT = 3
+RETRY_BACKOFF = 2
+RATE_LIMIT_SLEEP = (10, 30)
+
+def req_with_retry(
+    method: str,
+    url: str,
+    headers: Dict[str, str],
+    params: Optional[Dict[str, Any]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
+    files: Optional[Dict[str, Any]] = None,
+    data: Optional[Dict[str, Any]] = None,
+    timeout: int = 60
+) -> requests.Response:
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, RETRY_COUNT + 1):
+        try:
+            resp = requests.request(
+                method, url,
+                headers=headers,
+                params=params,
+                json=json_body,
+                data=data,
+                files=files,
+                timeout=timeout
+            )
+
+            # === Обработка rate limit ===
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", "5"))
+                logger.warning(f"⚠️ VK API rate limit (429). Пауза {retry_after}s перед повтором...")
+                time.sleep(retry_after)
+                continue
+
+            try:
+                result = resp.json()
+                vk_error = result.get("error", {})
+                if isinstance(vk_error, dict) and vk_error.get("error_code") in (9, 29):
+                    sleep_for = random.uniform(*RATE_LIMIT_SLEEP)
+                    logger.warning(f"⚠️ VK flood control ({vk_error.get('error_code')}). "
+                                   f"Пауза {sleep_for:.1f}s перед повтором...")
+                    time.sleep(sleep_for)
+                    continue
+            except Exception:
+                pass
+
+            if resp.status_code >= 500:
+                raise requests.HTTPError(f"{resp.status_code} {resp.text}")
+
+            return resp
+
+        except Exception as e:
+            last_exc = e
+            sleep_for = RETRY_BACKOFF ** (attempt - 1)
+            logger.warning(f"{method} {url} попытка {attempt}/{RETRY_COUNT} не удалась: {e}. "
+                           f"Повтор через {sleep_for:.1f}s")
+            time.sleep(sleep_for)
+
+    assert last_exc is not None
+    raise last_exc
 
 
 # === Утилиты ===
@@ -116,6 +183,7 @@ def get_output_filename(file_name: str, day_number: int):
 
 async def download_latest_csv(to_folder="/opt/bot/csv"):
     """Скачивает CSV из Telegram в папку to_folder (убирает дубликаты по исходному имени файла)."""
+    await asyncio.sleep(random.uniform(2, 4))
     os.makedirs(to_folder, exist_ok=True)
     logging.info("📥 Подключаемся к Telegram и скачиваем CSV в %s", to_folder)
     client = TelegramClient("session_master", API_ID, API_HASH)
@@ -164,8 +232,7 @@ def broker_channel_group(cid: str, day_number: int) -> str:
         "КР 2": [11896],
         "КР ДОП_4": [3587, 7389, 7553, 8614, 8732],
         "КР ДОП_5": [9189, 9190, 9191, 9192, 9193, 9194, 9413, 9441, 9443, 9453, 9889, 9899],
-        "КР ДОП_6": [10141, 10240],
-        "КР ДОП_7": [11682, 11729],
+        "КР ДОП_6": [10141, 10240, 11682, 11729],
         "КР ДОП_8": [12873],
         "КР ДОП_9": [16263],
     }
@@ -305,16 +372,17 @@ def upload_to_s3(file_path):
         send_error_sync(msg)
 
 
-def upload_user_list_vk(file_path, list_name, vk_token):
+def upload_user_list_vk(file_path, list_name, vk_token, list_type="phones"):
     """Загружает список в конкретный VK кабинет (token). Возвращает list_id."""
     url = f"{BASE_URL_V3}/remarketing/users_lists.json"
     headers = {"Authorization": f"Bearer {vk_token}"}
     files = {"file": open(file_path, "rb")}
-    data = {"name": list_name, "type": "phones"}
+    data = {"name": list_name, "type": list_type}
     try:
-        resp = requests.post(url, headers=headers, files=files, data=data, timeout=60)
+        resp = req_with_retry("POST", url, headers=headers, files=files, data=data, timeout=60)
     finally:
         files["file"].close()
+
     try:
         result = resp.json()
     except Exception:
@@ -338,31 +406,11 @@ def create_segment_vk(list_id, segment_name, vk_token):
             {"object_type": "remarketing_users_list", "params": {"source_id": list_id, "type": "positive"}}
         ],
     }
-    resp = requests.post(url, headers=headers, json=payload, timeout=60)
+    resp = req_with_retry("POST", url, headers=headers, json_body=payload, timeout=60)
     result = resp.json()
     if resp.status_code != 200 or isinstance(result.get("error"), dict):
         raise Exception(f"Ошибка создания сегмента: {result}")
     return result.get("id")
-
-
-def generate_sharing_key_for_owner(object_type: str, object_id: int, vk_token):
-    """Генерирует sharing key (для владельца) используя переданный токен."""
-    url = f"{BASE_URL_V2}/sharing_keys.json"
-    headers = {"Authorization": f"Bearer {vk_token}", "Content-Type": "application/json"}
-    payload = {
-        "sources": [{"object_type": object_type, "object_id": object_id}],
-        "users": [],
-        "send_email": False,
-    }
-    resp = requests.post(url, headers=headers, json=payload, timeout=60)
-    try:
-        result = resp.json()
-    except Exception:
-        raise Exception(f"Некорректный ответ sharing_keys: {resp.text}")
-    if resp.status_code != 200 or isinstance(result.get("error"), dict):
-        raise Exception(f"Ошибка при создании sharing key: {result}")
-    return result.get("sharing_key"), result.get("sharing_url")
-
 
 async def upload_to_all_vk_and_get_one_sharing_key(file_path, vk_tokens):
     """
@@ -375,6 +423,17 @@ async def upload_to_all_vk_and_get_one_sharing_key(file_path, vk_tokens):
 
     first_success = None  # tuple (list_id, token)
     for token in vk_tokens:
+        # Инициализируем счётчик, если его нет
+        if token not in VK_UPLOAD_COUNTERS:
+            VK_UPLOAD_COUNTERS[token] = 0
+
+        # 🔒 Проверяем лимит перед загрузкой
+        if VK_UPLOAD_COUNTERS[token] >= MAX_UPLOADS_PER_TOKEN:
+            logging.warning(
+                f"⚠️ Превышен лимит {MAX_UPLOADS_PER_TOKEN} загрузок для VK кабинета {token[:8]}... Пропускаем."
+            )
+            continue
+            
         try:
             list_id = upload_user_list_vk(file_path, list_name, token)
             create_segment_vk(list_id, segment_name, token)
@@ -440,8 +499,8 @@ async def process_previous_day_file():
         first_success = None
         for token in VK_ACCESS_TOKENS:
             try:
-                list_id = upload_user_list_vk(file_path, f"leads_sub6_{yesterday.strftime('%d.%m.%Y')}", token)
-                create_segment_vk(list_id, f"LAL leads_sub6_{yesterday.strftime('%d.%m.%Y')}", token)
+                list_id = upload_user_list_vk(file_path, f"ls6_{yesterday.strftime('%d.%m.%Y')}", token, list_type="vk")
+                create_segment_vk(list_id, f"LAL ls6_{yesterday.strftime('%d.%m.%Y')}", token)
                 if first_success is None:
                     first_success = (list_id, token)
             except Exception as e:
@@ -514,42 +573,8 @@ async def main():
         res = await upload_to_all_vk_and_get_one_sharing_key(txt, VK_ACCESS_TOKENS)
         if res and first_success is None:
             first_success = res
-        # небольшая пауза
-        await asyncio.sleep(random.uniform(0.5, 1.5))
 
-    # 7) После загрузки ВСЕХ файлов — генерируем один общий sharing key и отправляем ссылку в основной бот
-    if first_success:
-        try:
-            list_id_for_key, token_for_key = first_success
-            sharing_key, sharing_url = generate_sharing_key_for_owner("users_list", int(list_id_for_key), token_for_key)
-            # декодируем URL (убираем %-encoding) и отправляем **только** декодированную ссылку без доп надписей
-            decoded_url = urllib.parse.unquote(sharing_url) if sharing_url else None
-            if BOT_TOKEN and CHAT_ID and decoded_url:
-                try:
-                    resp = requests.post(
-                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                        data={"chat_id": CHAT_ID,
-                              "text": f"{decoded_url}",
-                              "disable_notification": True}
-                    )
-                    if resp.status_code != 200:
-                        logging.error("Не удалось отправить sharing key в основной бот: %s", resp.text)
-                        send_error_sync(f"Не удалось отправить sharing key в основной бот: {resp.status_code} {resp.text}")
-                except Exception as e:
-                    logging.exception("Ошибка отправки sharing key в основной бот")
-                    send_error_sync(f"Ошибка отправки sharing key в основной бот: {e}")
-            else:
-                logging.warning("BOT_TOKEN/CHAT_ID не настроены или decoded_url пустой, sharing_url: %s", sharing_url)
-                send_error_sync(f"Sharing key: {decoded_url or sharing_url}")
-            logging.info("Sharing key создан и отправлен: %s", decoded_url or sharing_url)
-        except Exception as e:
-            logging.exception("Ошибка при создании sharing key")
-            send_error_sync(f"Ошибка при создании sharing key: {e}")
-    else:
-        logging.warning("Не найден ни один успешный list_id для генерации sharing key.")
-        send_error_sync("Не найден ни один успешный list_id для генерации sharing key.")
-
-    # 8) Очистка: удаляем скачанные CSV и сгенерированные TXT из /opt/bot/csv и /opt/bot/txt
+    # 7) Очистка: удаляем скачанные CSV и сгенерированные TXT из /opt/bot/csv и /opt/bot/txt
     try:
         cleanup_files(csv_files)
         cleanup_files(txt_files)
