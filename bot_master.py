@@ -488,25 +488,17 @@ def order_txt_files(files):
 
 async def process_previous_day_file():
     """
-    Обрабатывает файл за вчерашний день:
-    - отправляет в Telegram,
-    - НЕ грузит в VK (это делаем позже общим проходом),
-    - возвращает путь к файлу (или None, если файла нет).
+    Проверяет наличие файла leads_sub6 за вчерашний день.
+    Возвращает путь, если файл найден (отправка и VK загрузка происходят позже).
     """
     yesterday = datetime.today() - timedelta(days=1)
     file_path = f"/opt/leads_postback/data/leads_sub6_{yesterday.strftime('%d.%m.%Y')}.txt"
     if not os.path.exists(file_path):
         logging.info("Файл leads_sub6 за вчера не найден: %s", file_path)
         return None
+    logging.info("Найден leads_sub6 файл за вчера: %s", file_path)
+    return file_path
 
-    try:
-        await send_file_to_telegram(file_path)  # только TG
-        return file_path
-    except Exception as e:
-        msg = f"Ошибка обработки leads_sub6: {e}"
-        logging.exception(msg)
-        await send_error_async(msg)
-        return None
 
 
 
