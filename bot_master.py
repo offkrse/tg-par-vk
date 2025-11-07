@@ -47,7 +47,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
-
+logger = logging.getLogger("bot_master")
 # === S3 клиент ===
 s3 = boto3.client(
     "s3",
