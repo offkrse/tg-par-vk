@@ -557,12 +557,12 @@ async def main():
     files_pipeline.extend(txt_files_ordered)
 
     # 7) ЭТАП 1 — сначала отправляем ВСЕ файлы в Telegram (без звука)
-    for path in files_pipeline:
-        try:
-            await send_file_to_telegram(path)
-        except Exception as e:
-            logging.exception("Ошибка отправки в Telegram")
-            await send_error_async(f"Ошибка при отправке файла в Telegram {path}: {e}")
+    #for path in files_pipeline:
+    #    try:
+    #        await send_file_to_telegram(path)
+    #    except Exception as e:
+    #        logging.exception("Ошибка отправки в Telegram")
+    #        await send_error_async(f"Ошибка при отправке файла в Telegram {path}: {e}")
 
     # 8) ЭТАП 2 — затем загружаем ВСЕ файлы в VK ADS (каждый файл — во все кабинеты)
     #    Для leads_sub6 нужен особый list_type/name, для остальных — по умолчанию.
