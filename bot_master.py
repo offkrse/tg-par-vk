@@ -213,7 +213,7 @@ async def download_latest_csv(to_folder="/opt/bot/csv"):
                     await msg.download_media(file=path)
                     result_files.append(path)
                     logging.info("✅ Скачан %s", filename)
-                    await asyncio.sleep(random.uniform(1, 2))
+                    await asyncio.sleep(random.uniform(3, 6))
             except Exception as e:
                 logging.exception("Ошибка при скачивании одного сообщения")
                 await send_error_async(f"Ошибка при скачивании сообщения: {e}")
@@ -557,12 +557,12 @@ async def main():
     files_pipeline.extend(txt_files_ordered)
 
     # 7) ЭТАП 1 — сначала отправляем ВСЕ файлы в Telegram (без звука)
-    #for path in files_pipeline:
-    #    try:
-    #        await send_file_to_telegram(path)
-    #    except Exception as e:
-    #        logging.exception("Ошибка отправки в Telegram")
-    #        await send_error_async(f"Ошибка при отправке файла в Telegram {path}: {e}")
+    for path in files_pipeline:
+        try:
+            await send_file_to_telegram(path)
+        except Exception as e:
+            logging.exception("Ошибка отправки в Telegram")
+            await send_error_async(f"Ошибка при отправке файла в Telegram {path}: {e}")
 
     # 8) ЭТАП 2 — затем загружаем ВСЕ файлы в VK ADS (каждый файл — во все кабинеты)
     #    Для leads_sub6 нужен особый list_type/name, для остальных — по умолчанию.
