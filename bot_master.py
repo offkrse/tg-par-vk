@@ -16,6 +16,7 @@ from collections import defaultdict
 
 load_dotenv()
 
+VersionBotMaster = 2.0
 # === Настройки ===
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
