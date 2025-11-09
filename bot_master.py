@@ -211,9 +211,11 @@ async def download_latest_csv(to_folder="/opt/bot/csv"):
                     filename = orig_name.replace(".csv", f" {date_suffix}.csv")
                     path = os.path.join(to_folder, filename)
                     await msg.download_media(file=path)
+                    if "6_web" in orig_name:
+                        await asyncio.sleep(90)
                     result_files.append(path)
                     logging.info("✅ Скачан %s", filename)
-                    await asyncio.sleep(random.uniform(3, 6))
+                    await asyncio.sleep(random.uniform(10, 20))
             except Exception as e:
                 logging.exception("Ошибка при скачивании одного сообщения")
                 await send_error_async(f"Ошибка при скачивании сообщения: {e}")
