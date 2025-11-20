@@ -16,7 +16,7 @@ from collections import defaultdict
 
 load_dotenv()
 
-VersionBotMaster = 2.0
+VersionBotMaster = "2.1"
 # === Настройки ===
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
@@ -252,6 +252,7 @@ def process_csv_files(files):
     today = datetime.today()
     day_number = get_day_number(today)
     output_data = defaultdict(set)
+    approve_phones = set()  # телефоны из 253.csv для LAL-файла
 
     for file in files:
         try:
@@ -315,6 +316,10 @@ def process_csv_files(files):
                     continue
                 if output_name:
                     output_data[output_name].update(phones)
+                # ДОП обработка: если это 253.csv → собираем телефоны отдельно
+                if "253" in fname:
+                    approve_phones.update(phones)
+
 
         except Exception as e:
             msg = f"Ошибка при обработке {file}: {e}"
@@ -329,6 +334,22 @@ def process_csv_files(files):
             f.write("\n".join(sorted(phones)))
         txt_files.append(path)
         logging.info("Сохранён TXT: %s (%d номеров)", name, len(phones))
+        
+    # === Сохранение b_approve_* в отдельную папку (НЕ в pipeline) ===
+    if approve_phones:
+        os.makedirs("/opt/bot/txt_for_lal", exist_ok=True)
+        date_str = today.strftime("%d_%m_%Y")
+        approve_path = f"/opt/bot/txt_for_lal/b_approve_{date_str}.txt"
+    
+        with open(approve_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(sorted(approve_phones)))
+    
+        logging.info(
+            "Сохранён LAL файл (НЕ идёт в S3/VK/TG): %s (%d номеров)",
+            approve_path,
+            len(approve_phones)
+        )
+
     return txt_files
 
 
