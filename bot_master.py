@@ -16,7 +16,7 @@ from collections import defaultdict
 
 load_dotenv()
 
-VersionBotMaster = "2.1"
+VersionBotMaster = "2.2"
 # === Настройки ===
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
@@ -27,6 +27,12 @@ S3_BUCKET = os.getenv("S3_BUCKET")
 S3_ENDPOINT = os.getenv("S3_ENDPOINT")
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY")
+
+# Второй (резервный/отдельный) бакет, из которого читаем new_subs_...txt из корня
+NEW_S3_BUCKET = os.getenv("NEW_S3_BUCKET")
+NEW_S3_ENDPOINT = os.getenv("NEW_S3_ENDPOINT")
+NEW_S3_ACCESS_KEY = os.getenv("NEW_S3_ACCESS_KEY")
+NEW_S3_SECRET_KEY = os.getenv("NEW_S3_SECRET_KEY")
 
 # поддержка нескольких токенов через CSV-вход в .env
 # VK_ACCESS_TOKENS = token1,token2,token3
@@ -525,6 +531,44 @@ async def process_previous_day_file():
 
 
 
+def download_new_subs_from_s3(to_folder="/opt/bot/new_subs"):
+    """
+    Скачивает файл new_subs_DD_MM_YYYY.txt из корня дополнительного S3 бакета.
+    Имя файла формируется для вчерашней даты.
+
+    Требуется установить окружение NEW_S3_BUCKET. Если не задано — ничего не делаем.
+    Можно задать отдельные креды и endpoint через NEW_S3_ENDPOINT, NEW_S3_ACCESS_KEY, NEW_S3_SECRET_KEY.
+    """
+    if not NEW_S3_BUCKET:
+        logging.info("NEW_S3_BUCKET не задан, пропускаем скачивание new_subs.")
+        return None
+
+    yesterday = datetime.today() - timedelta(days=1)
+    filename = f"new_subs_{yesterday.strftime('%d_%m_%Y')}.txt"
+    os.makedirs(to_folder, exist_ok=True)
+    local_path = os.path.join(to_folder, filename)
+
+    # Подготовка клиента: если заданы отдельные креды/endpoint — создаём новый клиент
+    try:
+        if NEW_S3_ACCESS_KEY or NEW_S3_SECRET_KEY or NEW_S3_ENDPOINT:
+            client = boto3.client(
+                "s3",
+                endpoint_url=NEW_S3_ENDPOINT if NEW_S3_ENDPOINT else (S3_ENDPOINT if S3_ENDPOINT else None),
+                aws_access_key_id=NEW_S3_ACCESS_KEY if NEW_S3_ACCESS_KEY else S3_ACCESS_KEY,
+                aws_secret_access_key=NEW_S3_SECRET_KEY if NEW_S3_SECRET_KEY else S3_SECRET_KEY
+            )
+        else:
+            client = s3
+
+        client.download_file(NEW_S3_BUCKET, filename, local_path)
+        logging.info("Скачан файл new_subs из бакета %s: %s", NEW_S3_BUCKET, filename)
+        return local_path
+    except Exception as e:
+        logging.exception("Ошибка при скачивании new_subs из S3: %s", e)
+        send_error_sync(f"Ошибка при скачивании new_subs из S3: {e}")
+        return None
+
+
 
 def cleanup_files(files):
     """Удаляет файлы из переданного списка, логируя ошибки, работает безопасно."""
@@ -540,6 +584,9 @@ def cleanup_files(files):
 # === Главный процесс ===
 async def main():
     logging.info("=== 🚀 Запуск bot_master ===")
+
+    # 0) Пробуем скачать new_subs из дополнительного бакета (если задан)
+    new_subs_path = download_new_subs_from_s3()
 
     # 1) Сначала обрабатываем файл leads_sub6 вчерашнего дня (Только TG, путь вернём для VK)
     leads_sub6_path = await process_previous_day_file()
@@ -576,8 +623,14 @@ async def main():
     #    - СНАЧАЛА отправить в TG (все)
     #    - ПОТОМ загрузить в VK (все, тем же порядком)
     files_pipeline = []
+
+    # Первым идёт new_subs (если найден)
+    if new_subs_path and os.path.exists(new_subs_path):
+        files_pipeline.append(new_subs_path)
+
     if leads_sub6_path and os.path.exists(leads_sub6_path):
         files_pipeline.append(leads_sub6_path)
+
     files_pipeline.extend(txt_files_ordered)
 
     # 7) ЭТАП 1 — сначала отправляем ВСЕ файлы в Telegram (без звука)
@@ -604,6 +657,14 @@ async def main():
                     list_type="vk",
                     segment_prefix="LAL "
                 )
+            elif fname.startswith("new_subs_"):
+                # Для new_subs используем list_type="vk" по требованию
+                res = await upload_to_all_vk_and_get_one_sharing_key(
+                    path, VK_ACCESS_TOKENS,
+                    list_name=None,
+                    list_type="vk",
+                    segment_prefix="LAL "
+                )
             else:
                 # Обычные TXT (типы телефонов)
                 res = await upload_to_all_vk_and_get_one_sharing_key(
@@ -618,10 +679,19 @@ async def main():
             logging.exception("Ошибка VK загрузки")
             send_error_sync(f"Ошибка VK загрузки {fname}: {e}")
 
-    # 9) Очистка временных файлов
+    # Удаляем локальную копию new_subs после отправки в TG и загрузки в VK
+    try:
+        if new_subs_path and os.path.exists(new_subs_path):
+            os.remove(new_subs_path)
+            logging.info("Удалён локальный new_subs файл: %s", new_subs_path)
+    except Exception:
+        logging.exception("Ошибка при удалении new_subs файла")
+
+    # 9) Очистка временных файлов Очистка временных файлов
     try:
         cleanup_files(csv_files)
         cleanup_files(txt_files)
+        # не удаляем new_subs и leads_sub6 специально — оставляем их по логике прежней
     except Exception:
         logging.exception("Ошибка при финальной очистке файлов")
 
