@@ -16,8 +16,9 @@ from collections import defaultdict
 
 load_dotenv()
 
-VersionBotMaster = "2.2"
+VersionBotMaster = "2.3"
 # === Настройки ===
+SEND_FILES_TO_TELEGRAM = False  # Если False — файлы в Telegram не отправляются
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 PHONE = os.getenv("PHONE")
@@ -634,12 +635,15 @@ async def main():
     files_pipeline.extend(txt_files_ordered)
 
     # 7) ЭТАП 1 — сначала отправляем ВСЕ файлы в Telegram (без звука)
-    for path in files_pipeline:
-        try:
-            await send_file_to_telegram(path)
-        except Exception as e:
-            logging.exception("Ошибка отправки в Telegram")
-            await send_error_async(f"Ошибка при отправке файла в Telegram {path}: {e}")
+    if SEND_FILES_TO_TELEGRAM:
+        for path in files_pipeline:
+            try:
+                await send_file_to_telegram(path)
+            except Exception as e:
+                logging.exception("Ошибка отправки в Telegram")
+                await send_error_async(f"Ошибка при отправке файла в Telegram {path}: {e}")
+    else:
+        logging.info("⏭️ Отправка файлов в Telegram отключена (SEND_FILES_TO_TELEGRAM=False)")
 
     # 8) ЭТАП 2 — затем загружаем ВСЕ файлы в VK ADS (каждый файл — во все кабинеты)
     #    Для leads_sub6 нужен особый list_type/name, для остальных — по умолчанию.
