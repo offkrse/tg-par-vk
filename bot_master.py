@@ -14,11 +14,18 @@ from datetime import datetime, timedelta
 from telethon import TelegramClient
 from collections import defaultdict
 
+# Импорт модуля проверки номеров
+try:
+    from max_checker import start_checker_task
+    MAX_CHECKER_AVAILABLE = True
+except ImportError:
+    MAX_CHECKER_AVAILABLE = False
+
 load_dotenv()
 
-VersionBotMaster = "2.3"
+VersionBotMaster = "2.4"
 # === Настройки ===
-SEND_FILES_TO_TELEGRAM = False  # Если False — файлы в Telegram не отправляются
+SEND_FILES_TO_TELEGRAM = True  # Если False — файлы в Telegram не отправляются
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 PHONE = os.getenv("PHONE")
@@ -620,6 +627,16 @@ async def main():
     # 5) Сортируем TXT файлы по требуемому порядку
     txt_files_ordered = order_txt_files(txt_files)
 
+    # 5.1) Запускаем max_checker параллельно (формирование файлов для проверки номеров)
+    checker_task = None
+    if MAX_CHECKER_AVAILABLE:
+        try:
+            checker_task = start_checker_task()
+            logging.info("🔍 Запущен max_checker в фоновом режиме")
+        except Exception as e:
+            logging.exception("Ошибка запуска max_checker")
+            await send_error_async(f"Ошибка запуска max_checker: {e}")
+
     # 6) Подготавливаем общий список файлов, которые надо:
     #    - СНАЧАЛА отправить в TG (все)
     #    - ПОТОМ загрузить в VK (все, тем же порядком)
@@ -698,6 +715,11 @@ async def main():
         # не удаляем new_subs и leads_sub6 специально — оставляем их по логике прежней
     except Exception:
         logging.exception("Ошибка при финальной очистке файлов")
+
+    # 10) Ожидаем завершения max_checker (если был запущен)
+    #     Примечание: max_checker работает долго (60+ минут), поэтому он отработает в фоне
+    if checker_task is not None:
+        logging.info("ℹ️ max_checker продолжает работу в фоне (ожидание ~60 минут до проверки статуса)")
 
     logging.info("✅ Все задачи завершены.")
 
