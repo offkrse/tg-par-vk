@@ -28,6 +28,31 @@ RESULTS_DIR = "/opt/bot/max_checker/results"
 # API endpoints
 API_BASE = "https://promouser.com/api"
 
+# Курс доллара к рублю
+USD_TO_RUB = 79
+
+# Курс USD/RUB (fallback если API недоступен)
+DEFAULT_USD_RUB_RATE = 90.0
+
+
+def get_usd_rub_rate() -> float:
+    """Получает текущий курс USD/RUB"""
+    try:
+        # ЦБ РФ API
+        resp = requests.get(
+            "https://www.cbr-xml-daily.ru/daily_json.js",
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            rate = data.get("Valute", {}).get("USD", {}).get("Value", DEFAULT_USD_RUB_RATE)
+            logger.info(f"Курс USD/RUB: {rate}")
+            return float(rate)
+    except Exception as e:
+        logger.warning(f"Не удалось получить курс USD/RUB: {e}, используем {DEFAULT_USD_RUB_RATE}")
+    
+    return DEFAULT_USD_RUB_RATE
+
 # Исключаемые файлы (по префиксу)
 EXCLUDED_PREFIXES = ("ББ", "КР ДОП_10", "leads_sub_6", "new_subs")
 
@@ -571,16 +596,20 @@ async def process_checker_order(file_path: str, original_lines_count: int):
     # Считаем строки в результате
     result_lines = count_lines(downloaded_path)
     
-    # Получаем баланс после
-    balance_after = check_balance()
-    if balance_after is None:
-        balance_after = balance_before - float(cost)
+    # Получаем баланс после (в долларах)
+    balance_after_usd = check_balance()
+    if balance_after_usd is None:
+        balance_after_usd = balance_before - float(cost)
     
-    charged = float(cost)
+    charged_usd = float(cost)
+    
+    # Конвертируем в рубли (целые числа)
+    balance_rub = int(balance_after_usd * USD_TO_RUB)
+    charged_rub = int(charged_usd * USD_TO_RUB)
     
     # Формируем сообщение
     message = (
-        f"💵Баланс: {balance_after:.0f}р (-{charged:.0f} р)\n"
+        f"💵Баланс: {balance_rub}р (-{charged_rub}р)\n"
         f"🧾Строк: {result_lines:,} (из {original_lines_count:,})".replace(",", ".")
     )
     
