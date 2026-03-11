@@ -32,7 +32,7 @@ API_BASE = "https://promouser.com/api"
 USD_TO_RUB = 79
 
 # Курс USD/RUB (fallback если API недоступен)
-DEFAULT_USD_RUB_RATE = 90.0
+DEFAULT_USD_RUB_RATE = 80.0
 
 
 def get_usd_rub_rate() -> float:
