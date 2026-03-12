@@ -23,9 +23,9 @@ except ImportError:
 
 load_dotenv()
 
-VersionBotMaster = "2.4"
+VersionBotMaster = "2.5"
 # === Настройки ===
-SEND_FILES_TO_TELEGRAM = True  # Если False — файлы в Telegram не отправляются
+SEND_FILES_TO_TELEGRAM = False  # Если False — файлы в Telegram не отправляются
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 PHONE = os.getenv("PHONE")
@@ -717,9 +717,15 @@ async def main():
         logging.exception("Ошибка при финальной очистке файлов")
 
     # 10) Ожидаем завершения max_checker (если был запущен)
-    #     Примечание: max_checker работает долго (60+ минут), поэтому он отработает в фоне
+    #     ВАЖНО: ждём реально, иначе systemd oneshot завершит процесс
     if checker_task is not None:
-        logging.info("ℹ️ max_checker продолжает работу в фоне (ожидание ~60 минут до проверки статуса)")
+        logging.info("⏳ Ожидаем завершения max_checker (60+ минут)...")
+        try:
+            await checker_task
+            logging.info("✅ max_checker завершён")
+        except Exception as e:
+            logging.exception(f"Ошибка в max_checker: {e}")
+            await send_error_async(f"Ошибка в max_checker: {e}")
 
     logging.info("✅ Все задачи завершены.")
 
