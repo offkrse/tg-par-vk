@@ -32,7 +32,7 @@ API_BASE = "https://promouser.com/api"
 USD_TO_RUB = 79
 
 # Курс USD/RUB (fallback если API недоступен)
-DEFAULT_USD_RUB_RATE = 80.0
+DEFAULT_USD_RUB_RATE = 90.0
 
 
 def get_usd_rub_rate() -> float:
@@ -53,8 +53,10 @@ def get_usd_rub_rate() -> float:
     
     return DEFAULT_USD_RUB_RATE
 
-# Исключаемые файлы (по префиксу)
-EXCLUDED_PREFIXES = ("ББ", "КР ДОП_10", "leads_sub_6", "new_subs")
+# Исключаемые файлы (точные префиксы без номера дня)
+EXCLUDED_PREFIXES = ("КР ДОП_10",)
+EXCLUDED_EXACT = ("ББ",)  # Точное совпадение (без ДОП)
+EXCLUDED_STARTSWITH = ("leads_sub_6", "new_subs")  # Начинается с
 
 # === Логирование ===
 logging.basicConfig(
@@ -92,14 +94,33 @@ def collect_phones_from_txt_files() -> Tuple[Set[str], Set[str]]:
     for filename in os.listdir(SOURCE_TXT_DIR):
         if not filename.endswith(".txt"):
             continue
-            
+        
+        # Извлекаем базовое имя без номера дня: "ББ (294).txt" -> "ББ"
+        base_name = filename.rsplit(" (", 1)[0] if " (" in filename else filename.replace(".txt", "")
+        
         # Проверяем исключения
         skip = False
-        for prefix in EXCLUDED_PREFIXES:
-            if filename.startswith(prefix):
-                skip = True
-                logger.info(f"Пропускаем файл (в исключениях): {filename}")
-                break
+        
+        # Точное совпадение (например "ББ", но не "ББ ДОП_2")
+        if base_name in EXCLUDED_EXACT:
+            skip = True
+            logger.info(f"Пропускаем файл (точное совпадение): {filename}")
+        
+        # Префиксы (например "КР ДОП_10")
+        if not skip:
+            for prefix in EXCLUDED_PREFIXES:
+                if base_name.startswith(prefix):
+                    skip = True
+                    logger.info(f"Пропускаем файл (префикс): {filename}")
+                    break
+        
+        # Начинается с (для leads_sub_6, new_subs)
+        if not skip:
+            for prefix in EXCLUDED_STARTSWITH:
+                if filename.startswith(prefix):
+                    skip = True
+                    logger.info(f"Пропускаем файл (startswith): {filename}")
+                    break
         
         if skip:
             continue
