@@ -23,10 +23,11 @@ except ImportError:
 
 load_dotenv()
 
-VersionBotMaster = "2.7"
+VersionBotMaster = "2.8"
 # === Настройки ===
-SEND_FILES_TO_TELEGRAM = False  # Если False — файлы в Telegram не отправляются
-SKIP_VK_UPLOAD = True  # Если True — загрузка в VK кабинеты пропускается
+DOWNLOAD_FROM_TG = False  # Если True — скачиваем CSV из Telegram, если False — берём TXT из /opt/bot/txt/
+SEND_FILES_TO_TELEGRAM = False  # Если True — файлы отправляются в Telegram
+VK_UPLOAD = False  # Если True — файлы загружаются в VK кабинеты
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 PHONE = os.getenv("PHONE")
@@ -623,30 +624,51 @@ async def main():
     # 1) Сначала обрабатываем файл leads_sub6 вчерашнего дня (Только TG, путь вернём для VK)
     leads_sub6_path = await process_previous_day_file()
 
-    # 2) Скачиваем CSV из Telegram в /opt/bot/csv
-    csv_files = await download_latest_csv("/opt/bot/csv")
-    if not csv_files:
-        msg = "CSV файлы не найдены в Telegram."
-        logging.warning(msg)
-        await send_error_async(msg)
-        return
+    csv_files = []
+    txt_files = []
 
-    # 3) Обрабатываем CSV -> TXT
-    txt_files = process_csv_files(csv_files)
-    if not txt_files:
-        msg = "Не получили TXT файлы после обработки CSV."
-        logging.warning(msg)
-        await send_error_async(msg)
-        cleanup_files(csv_files)
-        return
+    if DOWNLOAD_FROM_TG:
+        # 2) Скачиваем CSV из Telegram в /opt/bot/csv
+        csv_files = await download_latest_csv("/opt/bot/csv")
+        if not csv_files:
+            msg = "CSV файлы не найдены в Telegram."
+            logging.warning(msg)
+            await send_error_async(msg)
+            return
 
-    # 4) Загрузка TXT в S3 (CSV не трогаем)
-    for f in txt_files:
-        try:
-            upload_to_s3(f)
-        except Exception as e:
-            logging.exception("Ошибка загрузки в S3")
-            send_error_sync(f"Ошибка загрузки в S3 {f}: {e}")
+        # 3) Обрабатываем CSV -> TXT
+        txt_files = process_csv_files(csv_files)
+        if not txt_files:
+            msg = "Не получили TXT файлы после обработки CSV."
+            logging.warning(msg)
+            await send_error_async(msg)
+            cleanup_files(csv_files)
+            return
+
+        # 4) Загрузка TXT в S3 (CSV не трогаем)
+        for f in txt_files:
+            try:
+                upload_to_s3(f)
+            except Exception as e:
+                logging.exception("Ошибка загрузки в S3")
+                send_error_sync(f"Ошибка загрузки в S3 {f}: {e}")
+    else:
+        # Берём существующие TXT файлы из /opt/bot/txt/
+        logging.info("⏭️ Скачивание из Telegram пропущено (DOWNLOAD_FROM_TG=False)")
+        txt_dir = "/opt/bot/txt"
+        if os.path.exists(txt_dir):
+            txt_files = [
+                os.path.join(txt_dir, f) 
+                for f in os.listdir(txt_dir) 
+                if f.endswith(".txt")
+            ]
+            logging.info(f"Найдено {len(txt_files)} TXT файлов в {txt_dir}")
+        
+        if not txt_files:
+            msg = "TXT файлы не найдены в /opt/bot/txt/"
+            logging.warning(msg)
+            await send_error_async(msg)
+            return
 
     # 5) Сортируем TXT файлы по требуемому порядку
     txt_files_ordered = order_txt_files(txt_files)
@@ -689,7 +711,7 @@ async def main():
     # 8) ЭТАП 2 — затем загружаем ВСЕ файлы в VK ADS (каждый файл — во все кабинеты)
     #    Для leads_sub6 нужен особый list_type/name, для остальных — по умолчанию.
     first_success = None
-    if not SKIP_VK_UPLOAD:
+    if VK_UPLOAD:
         for path in files_pipeline:
             fname = os.path.basename(path)
             try:
@@ -725,7 +747,7 @@ async def main():
                 logging.exception("Ошибка VK загрузки")
                 send_error_sync(f"Ошибка VK загрузки {fname}: {e}")
     else:
-        logging.info("⏭️ Загрузка в VK пропущена (SKIP_VK_UPLOAD=True)")
+        logging.info("⏭️ Загрузка в VK пропущена (VK_UPLOAD=False)")
 
     # Удаляем локальную копию new_subs после отправки в TG и загрузки в VK
     try:
@@ -746,9 +768,10 @@ async def main():
             logging.exception(f"Ошибка в max_checker: {e}")
             await send_error_async(f"Ошибка в max_checker: {e}")
 
-    # 10) Очистка временных файлов — удаляем CSV сегодня, TXT за ВЧЕРА
+    # 10) Очистка временных файлов — удаляем CSV сегодня (если скачивали), TXT за ВЧЕРА
     try:
-        cleanup_files(csv_files)  # CSV удаляем сразу
+        if DOWNLOAD_FROM_TG and csv_files:
+            cleanup_files(csv_files)  # CSV удаляем только если скачивали из TG
         # TXT за вчерашний день удаляем
         cleanup_previous_day_txt_files()
     except Exception:
