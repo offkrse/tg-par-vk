@@ -23,10 +23,10 @@ except ImportError:
 
 load_dotenv()
 
-VersionBotMaster = "2.6"
+VersionBotMaster = "2.7"
 # === Настройки ===
-SEND_FILES_TO_TELEGRAM = True  # Если False — файлы в Telegram не отправляются
-SKIP_VK_UPLOAD = False  # Если True — загрузка в VK кабинеты пропускается
+SEND_FILES_TO_TELEGRAM = False  # Если False — файлы в Telegram не отправляются
+SKIP_VK_UPLOAD = True  # Если True — загрузка в VK кабинеты пропускается
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 PHONE = os.getenv("PHONE")
@@ -718,12 +718,12 @@ async def main():
                         list_name=None,
                         list_type="phones",
                         segment_prefix="LAL "
-                )
-            if res and first_success is None:
-                first_success = res
-        except Exception as e:
-            logging.exception("Ошибка VK загрузки")
-            send_error_sync(f"Ошибка VK загрузки {fname}: {e}")
+                    )
+                if res and first_success is None:
+                    first_success = res
+            except Exception as e:
+                logging.exception("Ошибка VK загрузки")
+                send_error_sync(f"Ошибка VK загрузки {fname}: {e}")
     else:
         logging.info("⏭️ Загрузка в VK пропущена (SKIP_VK_UPLOAD=True)")
 
