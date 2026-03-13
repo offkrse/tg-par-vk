@@ -23,9 +23,10 @@ except ImportError:
 
 load_dotenv()
 
-VersionBotMaster = "2.5"
+VersionBotMaster = "2.6"
 # === Настройки ===
-SEND_FILES_TO_TELEGRAM = False  # Если False — файлы в Telegram не отправляются
+SEND_FILES_TO_TELEGRAM = True  # Если False — файлы в Telegram не отправляются
+SKIP_VK_UPLOAD = False  # Если True — загрузка в VK кабинеты пропускается
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 PHONE = os.getenv("PHONE")
@@ -589,6 +590,29 @@ def cleanup_files(files):
             logging.exception("Ошибка при удалении файла: %s", f)
 
 
+def cleanup_previous_day_txt_files():
+    """
+    Удаляет TXT файлы за предыдущий день из /opt/bot/txt.
+    Определяет вчерашний номер дня и удаляет файлы с этим номером.
+    """
+    txt_dir = "/opt/bot/txt"
+    if not os.path.exists(txt_dir):
+        return
+    
+    yesterday = datetime.today() - timedelta(days=1)
+    yesterday_day_number = get_day_number(yesterday)
+    pattern = f"({yesterday_day_number}).txt"
+    
+    for filename in os.listdir(txt_dir):
+        if filename.endswith(pattern):
+            filepath = os.path.join(txt_dir, filename)
+            try:
+                os.remove(filepath)
+                logging.info("Удалён вчерашний TXT файл: %s", filename)
+            except Exception:
+                logging.exception("Ошибка при удалении файла: %s", filepath)
+
+
 # === Главный процесс ===
 async def main():
     logging.info("=== 🚀 Запуск bot_master ===")
@@ -665,40 +689,43 @@ async def main():
     # 8) ЭТАП 2 — затем загружаем ВСЕ файлы в VK ADS (каждый файл — во все кабинеты)
     #    Для leads_sub6 нужен особый list_type/name, для остальных — по умолчанию.
     first_success = None
-    for path in files_pipeline:
-        fname = os.path.basename(path)
-        try:
-            if fname.startswith("leads_sub6_"):
-                # Нейминг, как был раньше
-                date_part = fname.replace("leads_sub6_", "").replace(".txt", "")
-                custom_list_name = f"ls6_{date_part}"
-                res = await upload_to_all_vk_and_get_one_sharing_key(
-                    path, VK_ACCESS_TOKENS,
-                    list_name=custom_list_name,
-                    list_type="vk",
-                    segment_prefix="LAL "
-                )
-            elif fname.startswith("new_subs_"):
-                # Для new_subs используем list_type="vk" по требованию
-                res = await upload_to_all_vk_and_get_one_sharing_key(
-                    path, VK_ACCESS_TOKENS,
-                    list_name=None,
-                    list_type="vk",
-                    segment_prefix="LAL "
-                )
-            else:
-                # Обычные TXT (типы телефонов)
-                res = await upload_to_all_vk_and_get_one_sharing_key(
-                    path, VK_ACCESS_TOKENS,
-                    list_name=None,
-                    list_type="phones",
-                    segment_prefix="LAL "
+    if not SKIP_VK_UPLOAD:
+        for path in files_pipeline:
+            fname = os.path.basename(path)
+            try:
+                if fname.startswith("leads_sub6_"):
+                    # Нейминг, как был раньше
+                    date_part = fname.replace("leads_sub6_", "").replace(".txt", "")
+                    custom_list_name = f"ls6_{date_part}"
+                    res = await upload_to_all_vk_and_get_one_sharing_key(
+                        path, VK_ACCESS_TOKENS,
+                        list_name=custom_list_name,
+                        list_type="vk",
+                        segment_prefix="LAL "
+                    )
+                elif fname.startswith("new_subs_"):
+                    # Для new_subs используем list_type="vk" по требованию
+                    res = await upload_to_all_vk_and_get_one_sharing_key(
+                        path, VK_ACCESS_TOKENS,
+                        list_name=None,
+                        list_type="vk",
+                        segment_prefix="LAL "
+                    )
+                else:
+                    # Обычные TXT (типы телефонов)
+                    res = await upload_to_all_vk_and_get_one_sharing_key(
+                        path, VK_ACCESS_TOKENS,
+                        list_name=None,
+                        list_type="phones",
+                        segment_prefix="LAL "
                 )
             if res and first_success is None:
                 first_success = res
         except Exception as e:
             logging.exception("Ошибка VK загрузки")
             send_error_sync(f"Ошибка VK загрузки {fname}: {e}")
+    else:
+        logging.info("⏭️ Загрузка в VK пропущена (SKIP_VK_UPLOAD=True)")
 
     # Удаляем локальную копию new_subs после отправки в TG и загрузки в VK
     try:
@@ -708,16 +735,8 @@ async def main():
     except Exception:
         logging.exception("Ошибка при удалении new_subs файла")
 
-    # 9) Очистка временных файлов Очистка временных файлов
-    try:
-        cleanup_files(csv_files)
-        cleanup_files(txt_files)
-        # не удаляем new_subs и leads_sub6 специально — оставляем их по логике прежней
-    except Exception:
-        logging.exception("Ошибка при финальной очистке файлов")
-
-    # 10) Ожидаем завершения max_checker (если был запущен)
-    #     ВАЖНО: ждём реально, иначе systemd oneshot завершит процесс
+    # 9) Ожидаем завершения max_checker ПЕРЕД удалением файлов
+    #    ВАЖНО: ждём реально, иначе systemd oneshot завершит процесс
     if checker_task is not None:
         logging.info("⏳ Ожидаем завершения max_checker (60+ минут)...")
         try:
@@ -726,6 +745,14 @@ async def main():
         except Exception as e:
             logging.exception(f"Ошибка в max_checker: {e}")
             await send_error_async(f"Ошибка в max_checker: {e}")
+
+    # 10) Очистка временных файлов — удаляем CSV сегодня, TXT за ВЧЕРА
+    try:
+        cleanup_files(csv_files)  # CSV удаляем сразу
+        # TXT за вчерашний день удаляем
+        cleanup_previous_day_txt_files()
+    except Exception:
+        logging.exception("Ошибка при финальной очистке файлов")
 
     logging.info("✅ Все задачи завершены.")
 
