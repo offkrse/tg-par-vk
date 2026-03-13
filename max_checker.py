@@ -53,11 +53,6 @@ def get_usd_rub_rate() -> float:
     
     return DEFAULT_USD_RUB_RATE
 
-# Исключаемые файлы (точные префиксы без номера дня)
-EXCLUDED_PREFIXES = ("КР ДОП_10",)
-EXCLUDED_EXACT = ("ББ",)  # Точное совпадение (без ДОП)
-EXCLUDED_STARTSWITH = ("leads_sub_6", "new_subs")  # Начинается с
-
 # === Логирование ===
 logging.basicConfig(
     filename="/opt/bot/max_checker.log",
@@ -81,8 +76,8 @@ def get_today_date_str() -> str:
 def collect_phones_from_txt_files() -> Tuple[Set[str], Set[str]]:
     """
     Собирает номера из TXT файлов.
+    Берёт ТОЛЬКО файлы Б1 и Б0.
     Возвращает (все номера, номера из Б1).
-    Исключает файлы с префиксами из EXCLUDED_PREFIXES.
     """
     all_phones: Set[str] = set()
     b1_phones: Set[str] = set()
@@ -91,38 +86,19 @@ def collect_phones_from_txt_files() -> Tuple[Set[str], Set[str]]:
         logger.warning(f"Директория {SOURCE_TXT_DIR} не существует")
         return all_phones, b1_phones
     
+    # Берём только Б1 и Б0
+    ALLOWED_PREFIXES = ("Б1", "Б0")
+    
     for filename in os.listdir(SOURCE_TXT_DIR):
         if not filename.endswith(".txt"):
             continue
         
-        # Извлекаем базовое имя без номера дня: "ББ (294).txt" -> "ББ"
+        # Извлекаем базовое имя без номера дня: "Б1 (294).txt" -> "Б1"
         base_name = filename.rsplit(" (", 1)[0] if " (" in filename else filename.replace(".txt", "")
         
-        # Проверяем исключения
-        skip = False
-        
-        # Точное совпадение (например "ББ", но не "ББ ДОП_2")
-        if base_name in EXCLUDED_EXACT:
-            skip = True
-            logger.info(f"Пропускаем файл (точное совпадение): {filename}")
-        
-        # Префиксы (например "КР ДОП_10")
-        if not skip:
-            for prefix in EXCLUDED_PREFIXES:
-                if base_name.startswith(prefix):
-                    skip = True
-                    logger.info(f"Пропускаем файл (префикс): {filename}")
-                    break
-        
-        # Начинается с (для leads_sub_6, new_subs)
-        if not skip:
-            for prefix in EXCLUDED_STARTSWITH:
-                if filename.startswith(prefix):
-                    skip = True
-                    logger.info(f"Пропускаем файл (startswith): {filename}")
-                    break
-        
-        if skip:
+        # Проверяем, что это Б1 или Б0
+        if base_name not in ALLOWED_PREFIXES:
+            logger.info(f"Пропускаем файл (не Б1/Б0): {filename}")
             continue
         
         filepath = os.path.join(SOURCE_TXT_DIR, filename)
@@ -133,11 +109,11 @@ def collect_phones_from_txt_files() -> Tuple[Set[str], Set[str]]:
             all_phones.update(phones)
             
             # Проверяем, является ли файл Б1
-            if filename.startswith("Б1"):
+            if base_name == "Б1":
                 b1_phones.update(phones)
                 logger.info(f"Файл Б1: {filename}, номеров: {len(phones)}")
             else:
-                logger.info(f"Обработан файл: {filename}, номеров: {len(phones)}")
+                logger.info(f"Файл Б0: {filename}, номеров: {len(phones)}")
                 
         except Exception as e:
             logger.exception(f"Ошибка при чтении {filepath}: {e}")
@@ -519,22 +495,49 @@ def count_lines(file_path: str) -> int:
         return 0
 
 
-async def wait_for_order_completion(order_id: int, initial_delay: int = 3600, check_interval: int = 60) -> dict:
+async def wait_for_order_completion(order_id: int, lines_count: int, check_interval: int = 60) -> dict:
     """
     Ожидает завершения заказа.
-    Начинает проверять через initial_delay секунд (60 минут),
-    затем проверяет каждые check_interval секунд (1 минута).
+    1. Первая проверка через 1 минуту (для выявления ошибок, например нехватки средств)
+    2. Если нет ошибки - ждём время в зависимости от количества строк (1000 строк ~ 2 минуты)
+    3. Далее проверяем каждую минуту
     """
-    logger.info(f"Ожидание {initial_delay} сек перед первой проверкой статуса...")
-    await asyncio.sleep(initial_delay)
+    # Первая проверка через 1 минуту - для выявления ошибок
+    logger.info("Ожидание 60 сек перед первой проверкой статуса (проверка ошибок)...")
+    await asyncio.sleep(60)
     
+    status_data = check_order_status(order_id)
+    
+    if "error" in status_data:
+        error_msg = str(status_data.get("error", ""))
+        # Если ошибка нехватки средств - сразу возвращаем
+        if "Insufficient funds" in error_msg:
+            logger.error(f"Недостаточно средств: {status_data}")
+            return status_data
+    
+    status = status_data.get("status", "")
+    logger.info(f"Статус заказа {order_id} после первой проверки: {status}")
+    
+    # Если уже готов - возвращаем
+    if status == "ready_paid":
+        return status_data
+    
+    # Рассчитываем время ожидания: 1000 строк ~ 2 минуты
+    # Формула: (lines_count / 1000) * 2 минуты = (lines_count / 500) секунд
+    estimated_wait = int((lines_count / 1000) * 2 * 60)  # в секундах
+    # Минимум 2 минуты, вычитаем уже прошедшую 1 минуту
+    remaining_wait = max(estimated_wait - 60, 60)
+    
+    logger.info(f"Ожидание {remaining_wait} сек до следующей проверки (расчёт по {lines_count} строк)...")
+    await asyncio.sleep(remaining_wait)
+    
+    # Далее проверяем каждую минуту
     while True:
         status_data = check_order_status(order_id)
         
         if "error" in status_data:
             logger.error(f"Ошибка при проверке статуса: {status_data}")
-            await asyncio.sleep(check_interval)
-            continue
+            return status_data
         
         status = status_data.get("status", "")
         logger.info(f"Статус заказа {order_id}: {status}")
@@ -577,8 +580,8 @@ async def process_checker_order(file_path: str, original_lines_count: int):
     
     logger.info(f"Заказ {order_id} отправлен, ожидаем выполнения...")
     
-    # Ожидаем завершения (60 минут до первой проверки, затем каждую минуту)
-    result = await wait_for_order_completion(order_id, initial_delay=3600, check_interval=60)
+    # Ожидаем завершения (время зависит от количества строк)
+    result = await wait_for_order_completion(order_id, lines_count=original_lines_count, check_interval=60)
     
     if "error" in result:
         error_msg = result.get("error", "Unknown error")
