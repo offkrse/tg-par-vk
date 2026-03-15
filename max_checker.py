@@ -16,6 +16,8 @@ from dotenv import load_dotenv
 
 load_dotenv("/opt/bot/.env")
 
+VERSION_MAX_CHECKER = "1.0"
+
 # === Настройки ===
 PROMO_CHECKER_KEY = os.getenv("PROMO_CHECKER_KEY", "")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
