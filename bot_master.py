@@ -25,9 +25,9 @@ load_dotenv()
 
 VersionBotMaster = "2.8"
 # === Настройки ===
-DOWNLOAD_FROM_TG = False  # Если True — скачиваем CSV из Telegram, если False — берём TXT из /opt/bot/txt/
-SEND_FILES_TO_TELEGRAM = False  # Если True — файлы отправляются в Telegram
-VK_UPLOAD = False  # Если True — файлы загружаются в VK кабинеты
+DOWNLOAD_FROM_TG = True  # Если True — скачиваем CSV из Telegram, если False — берём TXT из /opt/bot/txt/
+SEND_FILES_TO_TELEGRAM = True  # Если True — файлы отправляются в Telegram
+VK_UPLOAD = True  # Если True — файлы загружаются в VK кабинеты
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 PHONE = os.getenv("PHONE")
