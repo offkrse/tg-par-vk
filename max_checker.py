@@ -9,6 +9,7 @@ import asyncio
 import logging
 import aiohttp
 import requests
+import csv
 from datetime import datetime
 from typing import Optional, Set, List, Tuple
 from dotenv import load_dotenv
@@ -33,6 +34,9 @@ USD_TO_RUB = 79
 
 # Курс USD/RUB (fallback если API недоступен)
 DEFAULT_USD_RUB_RATE = 90.0
+
+# Фильтр по активности (дней с последнего логина)
+MAX_ACTIVE_DAYS_AGO = 20
 
 
 def get_usd_rub_rate() -> float:
@@ -438,6 +442,58 @@ def download_result(url: str, save_path: str) -> bool:
         return False
 
 
+def filter_and_extract_ids(raw_file_path: str, output_path: str) -> Tuple[int, int]:
+    """
+    Читает CSV файл с результатами, фильтрует по Active_days_ago <= MAX_ACTIVE_DAYS_AGO,
+    извлекает только ID_MAX и сохраняет в output_path.
+    
+    Формат входного файла (CSV):
+    Phone_MAX,ID_MAX,First_name,Last_name,Last_login_time,Active_days_ago,Gender,Avatar_link
+    
+    Возвращает (количество отфильтрованных, количество исходных).
+    """
+    filtered_ids = []
+    total_count = 0
+    
+    try:
+        with open(raw_file_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            
+            for row in reader:
+                total_count += 1
+                
+                # Получаем Active_days_ago
+                active_days_str = row.get("Active_days_ago", "").strip()
+                
+                # Пропускаем если пустое или не число
+                if not active_days_str:
+                    continue
+                
+                try:
+                    active_days = int(active_days_str)
+                except ValueError:
+                    logger.warning(f"Некорректное значение Active_days_ago: {active_days_str}")
+                    continue
+                
+                # Фильтруем по активности
+                if active_days <= MAX_ACTIVE_DAYS_AGO:
+                    id_max = row.get("ID_MAX", "").strip()
+                    if id_max:
+                        filtered_ids.append(id_max)
+        
+        # Сохраняем отфильтрованные ID
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(filtered_ids))
+        
+        logger.info(f"Отфильтровано {len(filtered_ids)} из {total_count} записей (Active_days_ago <= {MAX_ACTIVE_DAYS_AGO})")
+        
+        return len(filtered_ids), total_count
+        
+    except Exception as e:
+        logger.exception(f"Ошибка при фильтрации результатов: {e}")
+        return 0, 0
+
+
 async def send_telegram_message(text: str, chat_id: str = CHECKER_CHAT_ID):
     """Отправляет сообщение в Telegram"""
     if not BOT_TOKEN:
@@ -617,8 +673,14 @@ async def process_checker_order(file_path: str, original_lines_count: int):
         await send_telegram_message("❌ Не удалось скачать результат")
         return
     
-    # Считаем строки в результате
-    result_lines = count_lines(downloaded_path)
+    # Считаем строки в исходном результате (включая заголовок)
+    raw_result_lines = count_lines(downloaded_path)
+    
+    # Фильтруем по Active_days_ago и извлекаем только ID_MAX
+    final_filename = f"max_ids_clean_{date_str}.txt"
+    final_path = os.path.join(RESULTS_DIR, final_filename)
+    
+    filtered_count, total_from_api = filter_and_extract_ids(downloaded_path, final_path)
     
     # Получаем баланс после (в долларах)
     balance_after_usd = check_balance()
@@ -634,25 +696,16 @@ async def process_checker_order(file_path: str, original_lines_count: int):
     # Формируем сообщение
     message = (
         f"💵Баланс: {balance_rub}р (-{charged_rub}р)\n"
-        f"🧾Строк: {result_lines:,} (из {original_lines_count:,})".replace(",", ".")
+        f"🧾Строк: {filtered_count:,} (активных ≤{MAX_ACTIVE_DAYS_AGO}д из {total_from_api:,})".replace(",", ".")
     )
     
     # Отправляем сообщение
     await send_telegram_message(message)
     
-    # Сохраняем и отправляем файл под именем max_ids_DD_MM_YYYY.txt
-    final_filename = f"max_ids_{date_str}.txt"
-    final_path = os.path.join(RESULTS_DIR, final_filename)
-    
-    # Копируем файл под новым именем (если это не тот же файл)
-    if downloaded_path != final_path:
-        import shutil
-        shutil.copy2(downloaded_path, final_path)
-    
-    # Отправляем файл
+    # Отправляем файл с отфильтрованными ID
     await send_telegram_file(final_path, custom_filename=final_filename)
     
-    logger.info(f"Проверка завершена: {result_lines} строк из {original_lines_count}")
+    logger.info(f"Проверка завершена: {filtered_count} активных ID из {total_from_api} (Active_days_ago <= {MAX_ACTIVE_DAYS_AGO})")
 
 
 async def handle_user_confirmation(user_message: str) -> bool:
