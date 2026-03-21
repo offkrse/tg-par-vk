@@ -23,7 +23,40 @@ except ImportError:
 
 load_dotenv()
 
-VersionBotMaster = "2.8"
+TG_PROXY_URL = os.getenv("TG_PROXY_URL", "").rstrip("/")
+TG_PROXY_SECRET = os.getenv("TG_PROXY_SECRET", "")
+TG_MTPROTO_HOST = os.getenv("TG_MTPROTO_HOST", "")
+TG_MTPROTO_PORT = int(os.getenv("TG_MTPROTO_PORT", "2083"))
+TG_MTPROTO_SECRET = os.getenv("TG_MTPROTO_SECRET", "")
+
+USE_TG_PROXY = bool(TG_PROXY_URL or TG_MTPROTO_HOST)
+
+
+def _bot_api_url(token: str, method: str) -> str:
+    """Возвращает URL для Bot API — через HTTP-прокси или напрямую."""
+    if TG_PROXY_URL:
+        return f"{TG_PROXY_URL}/bot{token}/{method}"
+    return f"https://api.telegram.org/bot{token}/{method}"
+
+
+def _proxy_headers() -> dict:
+    if TG_PROXY_SECRET:
+        return {"X-Proxy-Secret": TG_PROXY_SECRET}
+    return {}
+
+
+def _telethon_proxy():
+    """Возвращает параметр proxy для TelegramClient (MTProto) или None."""
+    if TG_MTPROTO_HOST and TG_MTPROTO_SECRET:
+        from telethon.network.connection.tcpmtproxy import ConnectionTcpMTProxyRandomizedIntermediate
+        return dict(
+            proxy=(TG_MTPROTO_HOST, TG_MTPROTO_PORT, TG_MTPROTO_SECRET),
+            connection=ConnectionTcpMTProxyRandomizedIntermediate,
+        )
+    return None
+
+
+VersionBotMaster = "2.9"
 # === Настройки ===
 DOWNLOAD_FROM_TG = True  # Если True — скачиваем CSV из Telegram, если False — берём TXT из /opt/bot/txt/
 SEND_FILES_TO_TELEGRAM = True  # Если True — файлы отправляются в Telegram
@@ -152,9 +185,11 @@ def send_error_sync(message: str):
         logging.warning(f"ERROR BOT not configured, would send: {message}")
         return
     try:
+        url = _bot_api_url(ERROR_BOT_TOKEN, "sendMessage")
         resp = requests.post(
-            f"https://api.telegram.org/bot{ERROR_BOT_TOKEN}/sendMessage",
-            data={"chat_id": ERROR_CHAT_ID, "text": f"ERROR /bot_master.py : {message}", "disable_notification": True}
+            url,
+            data={"chat_id": ERROR_CHAT_ID, "text": f"ERROR /bot_master.py : {message}", "disable_notification": True},
+            headers=_proxy_headers()
         )
         if resp.status_code != 200:
             logging.error(f"Не удалось отправить ошибку в error-bot: {resp.status_code} {resp.text}")
@@ -169,10 +204,12 @@ async def send_error_async(message: str):
         logging.warning(f"ERROR BOT not configured, would send: {message}")
         return
     try:
+        url = _bot_api_url(ERROR_BOT_TOKEN, "sendMessage")
         async with aiohttp.ClientSession() as session:
             await session.post(
-                f"https://api.telegram.org/bot{ERROR_BOT_TOKEN}/sendMessage",
-                data={"chat_id": ERROR_CHAT_ID, "text": f"ERROR /bot_master.py : {message}", "disable_notification": "true"}
+                url,
+                data={"chat_id": ERROR_CHAT_ID, "text": f"ERROR /bot_master.py : {message}", "disable_notification": "true"},
+                headers=_proxy_headers()
             )
     except Exception:
         logging.exception("Ошибка при send_error_async")
@@ -199,11 +236,18 @@ def get_output_filename(file_name: str, day_number: int):
 
 
 async def download_latest_csv(to_folder="/opt/bot/csv"):
-    """Скачивает CSV из Telegram в папку to_folder (убирает дубликаты по исходному имени файла)."""
+    """Скачивает CSV из Telegram в папку to_folder (убирает дубликаты по исходному имени файла).
+       Если задан TG_PROXY_SOCKS5_HOST — использует SOCKS5 прокси для обхода блокировок."""
     await asyncio.sleep(random.uniform(2, 4))
     os.makedirs(to_folder, exist_ok=True)
-    logging.info("📥 Подключаемся к Telegram и скачиваем CSV в %s", to_folder)
-    client = TelegramClient("session_master", API_ID, API_HASH)
+
+    proxy_kwargs = _telethon_proxy() or {}
+    if proxy_kwargs:
+        logging.info("📥 Подключаемся к Telegram через MTProto прокси и скачиваем CSV в %s", to_folder)
+    else:
+        logging.info("📥 Подключаемся к Telegram напрямую и скачиваем CSV в %s", to_folder)
+
+    client = TelegramClient("session_master", API_ID, API_HASH, **proxy_kwargs)
     await client.start(PHONE)
 
     today = datetime.today()
@@ -374,6 +418,7 @@ async def send_file_to_telegram(file_path: str, chat_id: str = CHAT_ID):
     if not BOT_TOKEN or not chat_id:
         logging.warning("Telegram BOT_TOKEN or CHAT_ID not configured")
         return
+    url = _bot_api_url(BOT_TOKEN, "sendDocument")
     async with aiohttp.ClientSession() as session:
         try:
             with open(file_path, "rb") as f:
@@ -382,7 +427,7 @@ async def send_file_to_telegram(file_path: str, chat_id: str = CHAT_ID):
                 form.add_field("document", f)
                 form.add_field("disable_notification", "true")
                 async with session.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument", data=form
+                    url, data=form, headers=_proxy_headers()
                 ) as resp:
                     if resp.status != 200:
                         txt = await resp.text()
