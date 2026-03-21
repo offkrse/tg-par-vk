@@ -14,6 +14,8 @@ from datetime import datetime
 from typing import Optional, Set, List, Tuple
 from dotenv import load_dotenv
 
+VERSION_MAX_CHECKER = "1.1"
+
 load_dotenv("/opt/bot/.env")
 
 # === Прокси для Telegram ===
@@ -33,7 +35,6 @@ def _proxy_headers() -> dict:
     return {}
 
 
-VERSION_MAX_CHECKER = "1.1"
 
 # === Настройки ===
 PROMO_CHECKER_KEY = os.getenv("PROMO_CHECKER_KEY", "")
