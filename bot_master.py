@@ -14,6 +14,8 @@ from datetime import datetime, timedelta
 from telethon import TelegramClient
 from collections import defaultdict
 
+VersionBotMaster = "2.9"
+
 # Импорт модуля проверки номеров
 try:
     from max_checker import start_checker_task
@@ -55,8 +57,6 @@ def _telethon_proxy():
         )
     return None
 
-
-VersionBotMaster = "2.9"
 # === Настройки ===
 DOWNLOAD_FROM_TG = True  # Если True — скачиваем CSV из Telegram, если False — берём TXT из /opt/bot/txt/
 SEND_FILES_TO_TELEGRAM = True  # Если True — файлы отправляются в Telegram
