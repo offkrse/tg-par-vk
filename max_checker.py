@@ -33,7 +33,7 @@ def _proxy_headers() -> dict:
     return {}
 
 
-VERSION_MAX_CHECKER = "1.2"
+VERSION_MAX_CHECKER = "1.3"
 
 # === Настройки ===
 PROMO_CHECKER_KEY = os.getenv("PROMO_CHECKER_KEY", "")
@@ -679,78 +679,65 @@ async def wait_for_order_completion(order_id: int, lines_count: int, check_inter
         await asyncio.sleep(check_interval)
 
 
-async def process_checker_order(
+async def submit_order(
     file_path: str,
-    original_lines_count: int,
     phones_for_ac: List[str],
-    pack_name: str = "pack1",
-    result_filename: str = "",
-):
+    pack_name: str,
+) -> Optional[int]:
     """
-    Универсальный процесс: отправка заказа в promouser, ожидание, получение результата.
-
-    phones_for_ac   — номера, которые нужно записать в already_checked
-                      ТОЛЬКО при успешной отправке заказа.
-    pack_name       — "pack1" или "pack2" (используется в логах и именах файлов).
-    result_filename — итоговое имя файла в TГ (например "max_ids_pack2_21_03_2026.txt").
-                      Если пусто — генерируется автоматически.
+    Шаг 1: отправляет файл в promouser, получает order_id.
+    После успешной отправки сразу записывает номера в already_checked.
+    Возвращает order_id или None при ошибке.
     """
-    global _waiting_for_payment_confirmation, _pending_order_id, _pending_file_path
-    global _pending_original_count, _pending_phones_for_ac, _pending_pack_name, _pending_result_filename
-
     if not PROMO_CHECKER_KEY:
         logger.error("PROMO_CHECKER_KEY не настроен в .env")
-        return
+        return None
 
-    # Проверяем баланс перед отправкой
-    balance_before = check_balance()
-    if balance_before is None:
-        await send_telegram_message(f"❌ [{pack_name}] Не удалось проверить баланс")
-        return
-
-    # Отправляем заказ
     order_id = send_order(file_path, service_type=19, force=1)
     if order_id is None:
         await send_telegram_message(f"❌ [{pack_name}] Не удалось создать заказ")
-        return
+        return None
 
-    logger.info(f"[{pack_name}] Заказ {order_id} отправлен, ожидаем выполнения...")
+    logger.info(f"[{pack_name}] Заказ {order_id} отправлен успешно")
 
-    # ✅ Заказ успешно создан — теперь безопасно записываем в already_checked
+    # ✅ Заказ принят — записываем в already_checked
     if phones_for_ac:
         save_already_checked(set(phones_for_ac))
         logger.info(f"[{pack_name}] Записано в already_checked: {len(phones_for_ac)} номеров")
 
-    # Ожидаем завершения
-    result = await wait_for_order_completion(order_id, lines_count=original_lines_count, check_interval=60)
+    return order_id
+
+
+async def collect_and_send_result(
+    order_id: int,
+    lines_count: int,
+    pack_name: str,
+    result_filename: str,
+    balance_before: float,
+) -> None:
+    """
+    Шаг 2: ждёт готовности заказа, скачивает результат, фильтрует, отправляет в ТГ.
+    Запускается параллельно для обоих паков через asyncio.gather.
+    """
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    date_str = get_today_date_str()
+
+    result = await wait_for_order_completion(order_id, lines_count=lines_count, check_interval=60)
 
     if "error" in result:
         error_msg = result.get("error", "Unknown error")
         if "Insufficient funds" in str(error_msg):
-            _waiting_for_payment_confirmation = True
-            _pending_order_id = order_id
-            _pending_file_path = file_path
-            _pending_original_count = original_lines_count
-            _pending_phones_for_ac = []  # уже записаны выше
-            _pending_pack_name = pack_name
-            _pending_result_filename = result_filename
-            await send_telegram_message(f"⚠️ [{pack_name}] Недостаточно средств на балансе, повторить?")
-            return
+            await send_telegram_message(f"⚠️ [{pack_name}] Недостаточно средств — результат недоступен")
         else:
-            await send_telegram_message(f"❌ [{pack_name}] Ошибка: {error_msg}")
-            return
+            await send_telegram_message(f"❌ [{pack_name}] Ошибка ожидания: {error_msg}")
+        return
 
-    # Получаем URL результата
     result_url = result.get("result")
     cost = result.get("cost", "0")
 
     if not result_url:
         await send_telegram_message(f"❌ [{pack_name}] Не получен URL результата")
         return
-
-    # Скачиваем результат
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    date_str = get_today_date_str()
 
     original_filename = result_url.split("/")[-1]
     downloaded_path = os.path.join(RESULTS_DIR, original_filename)
@@ -759,14 +746,12 @@ async def process_checker_order(
         await send_telegram_message(f"❌ [{pack_name}] Не удалось скачать результат")
         return
 
-    # Фильтруем по Active_days_ago и извлекаем только ID_MAX
     if not result_filename:
         result_filename = f"max_ids_{pack_name}_{date_str}.txt"
     final_path = os.path.join(RESULTS_DIR, result_filename)
 
     filtered_count, total_from_api = filter_and_extract_ids(downloaded_path, final_path)
 
-    # Баланс после
     balance_after_usd = check_balance()
     if balance_after_usd is None:
         balance_after_usd = balance_before - float(cost)
@@ -784,6 +769,25 @@ async def process_checker_order(
     await send_telegram_file(final_path, custom_filename=result_filename)
 
     logger.info(f"[{pack_name}] Завершено: {filtered_count} активных ID из {total_from_api}")
+
+
+# Оставляем для обратной совместимости с handle_user_confirmation
+async def process_checker_order(
+    file_path: str,
+    original_lines_count: int,
+    phones_for_ac: List[str],
+    pack_name: str = "pack1",
+    result_filename: str = "",
+):
+    """Совмещённый вариант submit + collect для повторной отправки при нехватке средств."""
+    balance_before = check_balance() or 0.0
+    order_id = await submit_order(file_path, phones_for_ac, pack_name)
+    if order_id is None:
+        return
+    date_str = get_today_date_str()
+    if not result_filename:
+        result_filename = f"max_ids_{pack_name}_{date_str}.txt"
+    await collect_and_send_result(order_id, original_lines_count, pack_name, result_filename, balance_before)
 
 
 async def handle_user_confirmation(user_message: str) -> bool:
@@ -822,41 +826,64 @@ async def handle_user_confirmation(user_message: str) -> bool:
 
 async def run_max_checker():
     """
-    Главная функция модуля. Запускает pack1 и pack2 последовательно.
-    Вызывается после формирования TXT файлов в bot_master.
+    Главная функция модуля.
+
+    Порядок работы:
+      1. Подготовить файл pack1 (Б1 + Б0).
+      2. Загрузить pack1 в promouser → получить order_id1.
+         Сразу после успешной загрузки записать номера pack1 в already_checked.
+      3. Подготовить файл pack2 (ББ ДОП_2/3, КР 1..КР ДОП_9).
+      4. Загрузить pack2 в promouser → получить order_id2.
+         Сразу после успешной загрузки записать номера pack2 в already_checked.
+      5. Ждать готовности pack1 и pack2 параллельно (asyncio.gather).
+         Как только каждый готов — сразу отправлять результат в ТГ.
     """
     logger.info("=== Запуск max_checker ===")
     date_str = get_today_date_str()
 
-    # --- Pack 1: Б1 + Б0 ---
+    if not PROMO_CHECKER_KEY:
+        logger.error("PROMO_CHECKER_KEY не настроен в .env")
+        return
+
+    balance_before = check_balance() or 0.0
+
+    # ── Шаг 1: подготовка и загрузка pack1 ──────────────────────────────────
     logger.info("[pack1] Подготовка файла...")
     file_path1, lines_count1, phones_ac1 = create_non_check_files()
 
+    order_id1: Optional[int] = None
     if file_path1 and lines_count1 > 0:
-        await process_checker_order(
-            file_path1,
-            lines_count1,
-            phones_for_ac=phones_ac1,
-            pack_name="pack1",
-            result_filename=f"max_ids_clean_{date_str}.txt",
-        )
+        order_id1 = await submit_order(file_path1, phones_ac1, "pack1")
     else:
         logger.info("[pack1] Нет номеров для проверки")
 
-    # --- Pack 2: ББ ДОП_2, ББ ДОП_3, КР 1..КР ДОП_9 ---
+    # ── Шаг 2: подготовка и загрузка pack2 ──────────────────────────────────
+    # Запускается сразу после отправки pack1, не ожидая результата от promouser
     logger.info("[pack2] Подготовка файла...")
     file_path2, lines_count2, phones_ac2 = create_non_check_files_pack2()
 
+    order_id2: Optional[int] = None
     if file_path2 and lines_count2 > 0:
-        await process_checker_order(
-            file_path2,
-            lines_count2,
-            phones_for_ac=phones_ac2,
-            pack_name="pack2",
-            result_filename=f"max_ids_pack2_{date_str}.txt",
-        )
+        order_id2 = await submit_order(file_path2, phones_ac2, "pack2")
     else:
         logger.info("[pack2] Нет номеров для проверки")
+
+    # ── Шаг 3: параллельное ожидание и отправка результатов в ТГ ────────────
+    # Каждый pack отправляется в ТГ как только готов, независимо от другого
+    tasks = []
+    if order_id1 is not None:
+        tasks.append(collect_and_send_result(
+            order_id1, lines_count1, "pack1",
+            f"max_ids_clean_{date_str}.txt", balance_before,
+        ))
+    if order_id2 is not None:
+        tasks.append(collect_and_send_result(
+            order_id2, lines_count2, "pack2",
+            f"max_ids_pack2_{date_str}.txt", balance_before,
+        ))
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     logger.info("=== max_checker завершён ===")
 
