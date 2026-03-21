@@ -14,8 +14,6 @@ from datetime import datetime
 from typing import Optional, Set, List, Tuple
 from dotenv import load_dotenv
 
-VERSION_MAX_CHECKER = "1.1"
-
 load_dotenv("/opt/bot/.env")
 
 # === Прокси для Telegram ===
@@ -35,6 +33,7 @@ def _proxy_headers() -> dict:
     return {}
 
 
+VERSION_MAX_CHECKER = "1.2"
 
 # === Настройки ===
 PROMO_CHECKER_KEY = os.getenv("PROMO_CHECKER_KEY", "")
@@ -85,11 +84,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("max_checker")
 
-# Флаг ожидания подтверждения оплаты
+# Флаги ожидания подтверждения оплаты (pack1 и pack2 раздельно)
 _waiting_for_payment_confirmation = False
 _pending_order_id: Optional[int] = None
 _pending_file_path: Optional[str] = None
 _pending_original_count: int = 0
+_pending_phones_for_ac: List[str] = []
+_pending_pack_name: str = ""
+_pending_result_filename: str = ""
 
 
 def get_today_date_str() -> str:
@@ -97,52 +99,74 @@ def get_today_date_str() -> str:
     return datetime.today().strftime("%d_%m_%Y")
 
 
-def collect_phones_from_txt_files() -> Tuple[Set[str], Set[str]]:
+def collect_phones_by_prefixes(allowed_prefixes: Tuple[str, ...], priority_prefix: str = "") -> Tuple[Set[str], Set[str]]:
     """
-    Собирает номера из TXT файлов.
-    Берёт ТОЛЬКО файлы Б1 и Б0.
-    Возвращает (все номера, номера из Б1).
+    Универсальная функция сбора номеров из TXT файлов по списку префиксов.
+
+    allowed_prefixes  — какие файлы брать, например ("Б1", "Б0")
+    priority_prefix   — префикс с наивысшим приоритетом (идёт первым в итоговом списке)
+
+    Возвращает (all_phones, priority_phones).
     """
     all_phones: Set[str] = set()
-    b1_phones: Set[str] = set()
-    
+    priority_phones: Set[str] = set()
+
     if not os.path.exists(SOURCE_TXT_DIR):
         logger.warning(f"Директория {SOURCE_TXT_DIR} не существует")
-        return all_phones, b1_phones
-    
-    # Берём только Б1 и Б0
-    ALLOWED_PREFIXES = ("Б1", "Б0")
-    
+        return all_phones, priority_phones
+
     for filename in os.listdir(SOURCE_TXT_DIR):
         if not filename.endswith(".txt"):
             continue
-        
-        # Извлекаем базовое имя без номера дня: "Б1 (294).txt" -> "Б1"
+
+        # "Б1 (294).txt" -> "Б1",  "КР ДОП_5 (294).txt" -> "КР ДОП_5"
         base_name = filename.rsplit(" (", 1)[0] if " (" in filename else filename.replace(".txt", "")
-        
-        # Проверяем, что это Б1 или Б0
-        if base_name not in ALLOWED_PREFIXES:
-            logger.info(f"Пропускаем файл (не Б1/Б0): {filename}")
+
+        if base_name not in allowed_prefixes:
             continue
-        
+
         filepath = os.path.join(SOURCE_TXT_DIR, filename)
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 phones = {line.strip() for line in f if line.strip()}
-            
+
             all_phones.update(phones)
-            
-            # Проверяем, является ли файл Б1
-            if base_name == "Б1":
-                b1_phones.update(phones)
-                logger.info(f"Файл Б1: {filename}, номеров: {len(phones)}")
-            else:
-                logger.info(f"Файл Б0: {filename}, номеров: {len(phones)}")
-                
+
+            if priority_prefix and base_name == priority_prefix:
+                priority_phones.update(phones)
+
+            logger.info(f"Файл [{base_name}]: {filename}, номеров: {len(phones)}")
         except Exception as e:
             logger.exception(f"Ошибка при чтении {filepath}: {e}")
-    
-    return all_phones, b1_phones
+
+    return all_phones, priority_phones
+
+
+# --- Pack 1: Б1, Б0 ---
+def collect_phones_pack1() -> Tuple[Set[str], Set[str]]:
+    """Возвращает (all_phones, b1_phones) для pack1."""
+    return collect_phones_by_prefixes(("Б1", "Б0"), priority_prefix="Б1")
+
+
+# --- Pack 2: ББ ДОП_2, ББ ДОП_3, КР 1, КР 2, КР ДОП_3..КР ДОП_9 ---
+PACK2_PREFIXES: Tuple[str, ...] = (
+    "ББ ДОП_2", "ББ ДОП_3",
+    "КР 1", "КР 2",
+    "КР ДОП_3", "КР ДОП_4", "КР ДОП_5",
+    "КР ДОП_6", "КР ДОП_7", "КР ДОП_8", "КР ДОП_9",
+)
+
+
+def collect_phones_pack2() -> Tuple[Set[str], Set[str]]:
+    """Возвращает (all_phones, priority_phones) для pack2.
+    Приоритет — ББ ДОП_2 (идёт первым).
+    """
+    return collect_phones_by_prefixes(PACK2_PREFIXES, priority_prefix="ББ ДОП_2")
+
+
+# Оставляем старое имя как алиас для обратной совместимости
+def collect_phones_from_txt_files() -> Tuple[Set[str], Set[str]]:
+    return collect_phones_pack1()
 
 
 ALREADY_CHECKED_MAX_LINES = 200000  # Максимум строк в одном файле
@@ -292,54 +316,75 @@ def save_already_checked(phones: Set[str]):
         logger.exception(f"Ошибка при сохранении already_checked: {e}")
 
 
-def create_non_check_files() -> Tuple[Optional[str], int]:
+def prepare_pack_file(
+    pack_name: str,
+    all_phones: Set[str],
+    priority_phones: Set[str],
+    max_phones: int = 50000,
+) -> Tuple[Optional[str], int, List[str]]:
     """
-    Создаёт файлы non_check_DD_MM_YYYY.txt и non_check_wd_DD_MM_YYYY.txt
-    Возвращает (путь к non_check_wd файлу, количество строк в нём).
+    Универсальная подготовка файла для отправки в promouser.
+
+    1. Формирует упорядоченный список (priority_phones первыми).
+    2. Сохраняет полный список non_check_{pack_name}_{date}.txt.
+    3. Фильтрует already_checked.
+    4. Обрезает до max_phones.
+    5. Сохраняет итоговый файл non_check_wd_{pack_name}_{date}.txt.
+
+    ВАЖНО: в already_checked НЕ записывает — это делается снаружи,
+    только после успешной отправки заказа в API.
+
+    Возвращает (путь_к_файлу, кол-во строк, список_телефонов_для_записи_в_ac).
     """
     os.makedirs(TXTS_DIR, exist_ok=True)
     date_str = get_today_date_str()
-    
-    # Собираем номера
-    all_phones, b1_phones = collect_phones_from_txt_files()
-    
+
     if not all_phones:
-        logger.warning("Нет номеров для обработки")
-        return None, 0
-    
-    # Формируем список: сначала Б1, потом остальные
-    other_phones = all_phones - b1_phones
-    ordered_phones: List[str] = sorted(b1_phones) + sorted(other_phones)
-    
-    # Сохраняем non_check_DD_MM_YYYY.txt
-    non_check_path = os.path.join(TXTS_DIR, f"non_check_{date_str}.txt")
+        logger.warning(f"[{pack_name}] Нет номеров для обработки")
+        return None, 0, []
+
+    # Приоритетные идут первыми
+    other_phones = all_phones - priority_phones
+    ordered_phones: List[str] = sorted(priority_phones) + sorted(other_phones)
+
+    # Полный список (до фильтрации)
+    non_check_path = os.path.join(TXTS_DIR, f"non_check_{pack_name}_{date_str}.txt")
     with open(non_check_path, "w", encoding="utf-8") as f:
         f.write("\n".join(ordered_phones))
-    logger.info(f"Создан {non_check_path}: {len(ordered_phones)} номеров")
-    
-    # Убираем уже проверенные (с экономией памяти)
+    logger.info(f"[{pack_name}] Создан {non_check_path}: {len(ordered_phones)} номеров")
+
+    # Убираем уже проверенные
     phones_to_check = filter_already_checked(ordered_phones)
-    
-    # Обрезаем до 50000
+
+    # Обрезаем до лимита
     original_count = len(phones_to_check)
-    if len(phones_to_check) > 50000:
-        phones_to_check = phones_to_check[:50000]
-        logger.info(f"Обрезано до 50000 номеров (было {original_count})")
-    
+    if len(phones_to_check) > max_phones:
+        phones_to_check = phones_to_check[:max_phones]
+        logger.info(f"[{pack_name}] Обрезано до {max_phones} (было {original_count})")
+
     if not phones_to_check:
-        logger.warning("Все номера уже проверены")
-        return None, 0
-    
-    # Сохраняем non_check_wd_DD_MM_YYYY.txt
-    non_check_wd_path = os.path.join(TXTS_DIR, f"non_check_wd_{date_str}.txt")
+        logger.warning(f"[{pack_name}] Все номера уже проверены")
+        return None, 0, []
+
+    # Файл для отправки в API
+    non_check_wd_path = os.path.join(TXTS_DIR, f"non_check_wd_{pack_name}_{date_str}.txt")
     with open(non_check_wd_path, "w", encoding="utf-8") as f:
         f.write("\n".join(phones_to_check))
-    logger.info(f"Создан {non_check_wd_path}: {len(phones_to_check)} номеров")
-    
-    # Добавляем в already_checked (с разбиением на файлы)
-    save_already_checked(set(phones_to_check))
-    
-    return non_check_wd_path, len(phones_to_check)
+    logger.info(f"[{pack_name}] Создан {non_check_wd_path}: {len(phones_to_check)} номеров")
+
+    return non_check_wd_path, len(phones_to_check), phones_to_check
+
+
+def create_non_check_files() -> Tuple[Optional[str], int, List[str]]:
+    """Pack1 (Б1 + Б0). Возвращает (путь, кол-во, phones_for_ac)."""
+    all_phones, b1_phones = collect_phones_pack1()
+    return prepare_pack_file("pack1", all_phones, b1_phones)
+
+
+def create_non_check_files_pack2() -> Tuple[Optional[str], int, List[str]]:
+    """Pack2 (ББ ДОП_2, ББ ДОП_3, КР 1..9). Возвращает (путь, кол-во, phones_for_ac)."""
+    all_phones, priority_phones = collect_phones_pack2()
+    return prepare_pack_file("pack2", all_phones, priority_phones)
 
 
 # === API функции ===
@@ -634,100 +679,111 @@ async def wait_for_order_completion(order_id: int, lines_count: int, check_inter
         await asyncio.sleep(check_interval)
 
 
-async def process_checker_order(file_path: str, original_lines_count: int):
+async def process_checker_order(
+    file_path: str,
+    original_lines_count: int,
+    phones_for_ac: List[str],
+    pack_name: str = "pack1",
+    result_filename: str = "",
+):
     """
-    Основной процесс: отправка заказа, ожидание, получение результата.
+    Универсальный процесс: отправка заказа в promouser, ожидание, получение результата.
+
+    phones_for_ac   — номера, которые нужно записать в already_checked
+                      ТОЛЬКО при успешной отправке заказа.
+    pack_name       — "pack1" или "pack2" (используется в логах и именах файлов).
+    result_filename — итоговое имя файла в TГ (например "max_ids_pack2_21_03_2026.txt").
+                      Если пусто — генерируется автоматически.
     """
-    global _waiting_for_payment_confirmation, _pending_order_id, _pending_file_path, _pending_original_count
-    
+    global _waiting_for_payment_confirmation, _pending_order_id, _pending_file_path
+    global _pending_original_count, _pending_phones_for_ac, _pending_pack_name, _pending_result_filename
+
     if not PROMO_CHECKER_KEY:
         logger.error("PROMO_CHECKER_KEY не настроен в .env")
         return
-    
+
     # Проверяем баланс перед отправкой
     balance_before = check_balance()
     if balance_before is None:
-        await send_telegram_message("❌ Не удалось проверить баланс")
+        await send_telegram_message(f"❌ [{pack_name}] Не удалось проверить баланс")
         return
-    
+
     # Отправляем заказ
     order_id = send_order(file_path, service_type=19, force=1)
     if order_id is None:
-        await send_telegram_message("❌ Не удалось создать заказ")
+        await send_telegram_message(f"❌ [{pack_name}] Не удалось создать заказ")
         return
-    
-    logger.info(f"Заказ {order_id} отправлен, ожидаем выполнения...")
-    
-    # Ожидаем завершения (время зависит от количества строк)
+
+    logger.info(f"[{pack_name}] Заказ {order_id} отправлен, ожидаем выполнения...")
+
+    # ✅ Заказ успешно создан — теперь безопасно записываем в already_checked
+    if phones_for_ac:
+        save_already_checked(set(phones_for_ac))
+        logger.info(f"[{pack_name}] Записано в already_checked: {len(phones_for_ac)} номеров")
+
+    # Ожидаем завершения
     result = await wait_for_order_completion(order_id, lines_count=original_lines_count, check_interval=60)
-    
+
     if "error" in result:
         error_msg = result.get("error", "Unknown error")
         if "Insufficient funds" in str(error_msg):
-            # Недостаточно средств
             _waiting_for_payment_confirmation = True
             _pending_order_id = order_id
             _pending_file_path = file_path
             _pending_original_count = original_lines_count
-            await send_telegram_message("⚠️ Недостаточно средств на балансе, повторить?")
+            _pending_phones_for_ac = []  # уже записаны выше
+            _pending_pack_name = pack_name
+            _pending_result_filename = result_filename
+            await send_telegram_message(f"⚠️ [{pack_name}] Недостаточно средств на балансе, повторить?")
             return
         else:
-            await send_telegram_message(f"❌ Ошибка: {error_msg}")
+            await send_telegram_message(f"❌ [{pack_name}] Ошибка: {error_msg}")
             return
-    
+
     # Получаем URL результата
     result_url = result.get("result")
     cost = result.get("cost", "0")
-    
+
     if not result_url:
-        await send_telegram_message("❌ Не получен URL результата")
+        await send_telegram_message(f"❌ [{pack_name}] Не получен URL результата")
         return
-    
+
     # Скачиваем результат
     os.makedirs(RESULTS_DIR, exist_ok=True)
     date_str = get_today_date_str()
-    
-    # Извлекаем оригинальное имя файла из URL
+
     original_filename = result_url.split("/")[-1]
     downloaded_path = os.path.join(RESULTS_DIR, original_filename)
-    
+
     if not download_result(result_url, downloaded_path):
-        await send_telegram_message("❌ Не удалось скачать результат")
+        await send_telegram_message(f"❌ [{pack_name}] Не удалось скачать результат")
         return
-    
-    # Считаем строки в исходном результате (включая заголовок)
-    raw_result_lines = count_lines(downloaded_path)
-    
+
     # Фильтруем по Active_days_ago и извлекаем только ID_MAX
-    final_filename = f"max_ids_clean_{date_str}.txt"
-    final_path = os.path.join(RESULTS_DIR, final_filename)
-    
+    if not result_filename:
+        result_filename = f"max_ids_{pack_name}_{date_str}.txt"
+    final_path = os.path.join(RESULTS_DIR, result_filename)
+
     filtered_count, total_from_api = filter_and_extract_ids(downloaded_path, final_path)
-    
-    # Получаем баланс после (в долларах)
+
+    # Баланс после
     balance_after_usd = check_balance()
     if balance_after_usd is None:
         balance_after_usd = balance_before - float(cost)
-    
+
     charged_usd = float(cost)
-    
-    # Конвертируем в рубли (целые числа)
     balance_rub = int(balance_after_usd * USD_TO_RUB)
     charged_rub = int(charged_usd * USD_TO_RUB)
-    
-    # Формируем сообщение
+
     message = (
         f"💵Баланс: {balance_rub}р (-{charged_rub}р)\n"
         f"🧾Строк: {filtered_count:,} (активных ≤{MAX_ACTIVE_DAYS_AGO}д из {total_from_api:,})".replace(",", ".")
     )
-    
-    # Отправляем сообщение
+
     await send_telegram_message(message)
-    
-    # Отправляем файл с отфильтрованными ID
-    await send_telegram_file(final_path, custom_filename=final_filename)
-    
-    logger.info(f"Проверка завершена: {filtered_count} активных ID из {total_from_api} (Active_days_ago <= {MAX_ACTIVE_DAYS_AGO})")
+    await send_telegram_file(final_path, custom_filename=result_filename)
+
+    logger.info(f"[{pack_name}] Завершено: {filtered_count} активных ID из {total_from_api}")
 
 
 async def handle_user_confirmation(user_message: str) -> bool:
@@ -735,43 +791,73 @@ async def handle_user_confirmation(user_message: str) -> bool:
     Обрабатывает подтверждение пользователя на повторную отправку.
     Возвращает True если сообщение обработано.
     """
-    global _waiting_for_payment_confirmation, _pending_order_id, _pending_file_path, _pending_original_count
-    
+    global _waiting_for_payment_confirmation, _pending_order_id, _pending_file_path
+    global _pending_original_count, _pending_phones_for_ac, _pending_pack_name, _pending_result_filename
+
     if not _waiting_for_payment_confirmation:
         return False
-    
+
     if user_message.lower().strip() == "да":
         _waiting_for_payment_confirmation = False
-        
+
         if _pending_file_path and _pending_original_count > 0:
-            # Повторно отправляем заказ
-            await process_checker_order(_pending_file_path, _pending_original_count)
-        
+            await process_checker_order(
+                _pending_file_path,
+                _pending_original_count,
+                phones_for_ac=_pending_phones_for_ac,
+                pack_name=_pending_pack_name,
+                result_filename=_pending_result_filename,
+            )
+
         _pending_order_id = None
         _pending_file_path = None
         _pending_original_count = 0
+        _pending_phones_for_ac = []
+        _pending_pack_name = ""
+        _pending_result_filename = ""
         return True
-    
+
     return False
 
 
 async def run_max_checker():
     """
-    Главная функция модуля.
+    Главная функция модуля. Запускает pack1 и pack2 последовательно.
     Вызывается после формирования TXT файлов в bot_master.
     """
     logger.info("=== Запуск max_checker ===")
-    
-    # Создаём файлы для проверки
-    file_path, lines_count = create_non_check_files()
-    
-    if not file_path or lines_count == 0:
-        logger.info("Нет номеров для проверки")
-        return
-    
-    # Запускаем процесс проверки
-    await process_checker_order(file_path, lines_count)
-    
+    date_str = get_today_date_str()
+
+    # --- Pack 1: Б1 + Б0 ---
+    logger.info("[pack1] Подготовка файла...")
+    file_path1, lines_count1, phones_ac1 = create_non_check_files()
+
+    if file_path1 and lines_count1 > 0:
+        await process_checker_order(
+            file_path1,
+            lines_count1,
+            phones_for_ac=phones_ac1,
+            pack_name="pack1",
+            result_filename=f"max_ids_clean_{date_str}.txt",
+        )
+    else:
+        logger.info("[pack1] Нет номеров для проверки")
+
+    # --- Pack 2: ББ ДОП_2, ББ ДОП_3, КР 1..КР ДОП_9 ---
+    logger.info("[pack2] Подготовка файла...")
+    file_path2, lines_count2, phones_ac2 = create_non_check_files_pack2()
+
+    if file_path2 and lines_count2 > 0:
+        await process_checker_order(
+            file_path2,
+            lines_count2,
+            phones_for_ac=phones_ac2,
+            pack_name="pack2",
+            result_filename=f"max_ids_pack2_{date_str}.txt",
+        )
+    else:
+        logger.info("[pack2] Нет номеров для проверки")
+
     logger.info("=== max_checker завершён ===")
 
 
