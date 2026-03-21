@@ -16,7 +16,24 @@ from dotenv import load_dotenv
 
 load_dotenv("/opt/bot/.env")
 
-VERSION_MAX_CHECKER = "1.0"
+# === Прокси для Telegram ===
+_TG_PROXY_URL = os.getenv("TG_PROXY_URL", "").rstrip("/")
+_TG_PROXY_SECRET = os.getenv("TG_PROXY_SECRET", "")
+
+
+def _bot_api_url(token: str, method: str) -> str:
+    if _TG_PROXY_URL:
+        return f"{_TG_PROXY_URL}/bot{token}/{method}"
+    return f"https://api.telegram.org/bot{token}/{method}"
+
+
+def _proxy_headers() -> dict:
+    if _TG_PROXY_SECRET:
+        return {"X-Proxy-Secret": _TG_PROXY_SECRET}
+    return {}
+
+
+VERSION_MAX_CHECKER = "1.1"
 
 # === Настройки ===
 PROMO_CHECKER_KEY = os.getenv("PROMO_CHECKER_KEY", "")
@@ -497,16 +514,18 @@ def filter_and_extract_ids(raw_file_path: str, output_path: str) -> Tuple[int, i
 
 
 async def send_telegram_message(text: str, chat_id: str = CHECKER_CHAT_ID):
-    """Отправляет сообщение в Telegram"""
+    """Отправляет сообщение в Telegram (через прокси если задан)."""
     if not BOT_TOKEN:
         logger.warning("BOT_TOKEN не настроен")
         return
-    
+
+    url = _bot_api_url(BOT_TOKEN, "sendMessage")
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+                url,
+                data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                headers=_proxy_headers()
             ) as resp:
                 if resp.status != 200:
                     text_resp = await resp.text()
@@ -516,26 +535,26 @@ async def send_telegram_message(text: str, chat_id: str = CHECKER_CHAT_ID):
 
 
 async def send_telegram_file(file_path: str, caption: str = "", chat_id: str = CHECKER_CHAT_ID, custom_filename: str = None):
-    """Отправляет файл в Telegram"""
+    """Отправляет файл в Telegram (через прокси если задан)."""
     if not BOT_TOKEN:
         logger.warning("BOT_TOKEN не настроен")
         return
-    
+
+    url = _bot_api_url(BOT_TOKEN, "sendDocument")
     try:
         async with aiohttp.ClientSession() as session:
             with open(file_path, "rb") as f:
                 form = aiohttp.FormData()
                 form.add_field("chat_id", chat_id)
-                
+
                 filename = custom_filename or os.path.basename(file_path)
                 form.add_field("document", f, filename=filename)
-                
+
                 if caption:
                     form.add_field("caption", caption)
-                
+
                 async with session.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
-                    data=form
+                    url, data=form, headers=_proxy_headers()
                 ) as resp:
                     if resp.status != 200:
                         text_resp = await resp.text()
