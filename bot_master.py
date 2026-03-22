@@ -23,13 +23,24 @@ except ImportError:
 
 load_dotenv()
 
-TG_PROXY_URL = os.getenv("TG_PROXY_URL", "").rstrip("/")
+# === Прокси для Telegram (обход блокировок) ===
+# Задать в .env:
+#   TG_PROXY_URL=http://195.133.9.79:8080   # HTTP-прокси для Bot API (sendMessage, sendDocument)
+#   TG_PROXY_SECRET=                        # опциональный секрет для HTTP прокси
+#
+#   # SOCKS5 прокси для Telethon (скачивание CSV через MTProto):
+#   TG_SOCKS5_HOST=195.133.9.79
+#   TG_SOCKS5_PORT=1080
+#   TG_SOCKS5_USER=                         # если dante настроен с авторизацией
+#   TG_SOCKS5_PASS=
+TG_PROXY_URL    = os.getenv("TG_PROXY_URL", "").rstrip("/")
 TG_PROXY_SECRET = os.getenv("TG_PROXY_SECRET", "")
-TG_MTPROTO_HOST = os.getenv("TG_MTPROTO_HOST", "")
-TG_MTPROTO_PORT = int(os.getenv("TG_MTPROTO_PORT", "2083"))
-TG_MTPROTO_SECRET = os.getenv("TG_MTPROTO_SECRET", "")
+TG_SOCKS5_HOST  = os.getenv("TG_SOCKS5_HOST", "")
+TG_SOCKS5_PORT  = int(os.getenv("TG_SOCKS5_PORT", "1080"))
+TG_SOCKS5_USER  = os.getenv("TG_SOCKS5_USER", "")
+TG_SOCKS5_PASS  = os.getenv("TG_SOCKS5_PASS", "")
 
-USE_TG_PROXY = bool(TG_PROXY_URL or TG_MTPROTO_HOST)
+USE_TG_PROXY = bool(TG_PROXY_URL or TG_SOCKS5_HOST)
 
 
 def _bot_api_url(token: str, method: str) -> str:
@@ -47,47 +58,26 @@ def _proxy_headers() -> dict:
 
 def _telethon_proxy():
     """
-    Возвращает kwargs для TelegramClient с MTProto прокси или None.
-
-    Тип соединения определяется по префиксу секрета:
-      - ee...  → ConnectionTcpMTProxyRandomizedIntermediate
-      - dd...  → ConnectionTcpMTProxyIntermediate  (FakeTLS, обычный hex)
-      - иначе  → ConnectionTcpMTProxyIntermediate
-
-    Ошибка "readexactly size can not be less than zero" означает несовпадение
-    типа соединения — проверьте префикс секрета из ссылки t.me/proxy?secret=...
+    Возвращает kwargs для TelegramClient с SOCKS5 прокси или None.
+    Telethon использует python-socks для SOCKS5.
+    Требует: pip install pysocks
     """
-    if not (TG_MTPROTO_HOST and TG_MTPROTO_SECRET):
+    if not TG_SOCKS5_HOST:
         return None
 
-    from telethon.network.connection.tcpmtproxy import (
-        ConnectionTcpMTProxyIntermediate,
-        ConnectionTcpMTProxyRandomizedIntermediate,
+    import socks
+    proxy = (
+        socks.SOCKS5,
+        TG_SOCKS5_HOST,
+        TG_SOCKS5_PORT,
+        True,
+        TG_SOCKS5_USER or None,
+        TG_SOCKS5_PASS or None,
     )
-
-    # Определяем тип по префиксу секрета.
-    # Стандарт: ee → Randomized, dd/hex → Intermediate.
-    # Однако если сервер настроен иначе, можно переопределить через .env:
-    #   TG_MTPROTO_CONN=intermediate  (или: randomized)
-    secret = TG_MTPROTO_SECRET.lower()
-    conn_override = os.getenv("TG_MTPROTO_CONN", "").lower()
-
-    if conn_override == "intermediate":
-        conn_cls = ConnectionTcpMTProxyIntermediate
-    elif conn_override == "randomized":
-        conn_cls = ConnectionTcpMTProxyRandomizedIntermediate
-    elif secret.startswith("ee"):
-        conn_cls = ConnectionTcpMTProxyRandomizedIntermediate
-    else:
-        conn_cls = ConnectionTcpMTProxyIntermediate
-
-    return dict(
-        proxy=(TG_MTPROTO_HOST, TG_MTPROTO_PORT, TG_MTPROTO_SECRET),
-        connection=conn_cls,
-    )
+    return dict(proxy=proxy)
 
 
-VersionBotMaster = "2.91"
+VersionBotMaster = "3.0"
 # === Настройки ===
 DOWNLOAD_FROM_TG = True  # Если True — скачиваем CSV из Telegram, если False — берём TXT из /opt/bot/txt/
 SEND_FILES_TO_TELEGRAM = True  # Если True — файлы отправляются в Telegram
