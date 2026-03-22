@@ -77,11 +77,12 @@ def _telethon_proxy():
     return dict(proxy=proxy)
 
 
-VersionBotMaster = "3.0"
+VersionBotMaster = "3.1"
 # === Настройки ===
 DOWNLOAD_FROM_TG = True  # Если True — скачиваем CSV из Telegram, если False — берём TXT из /opt/bot/txt/
 SEND_FILES_TO_TELEGRAM = True  # Если True — файлы отправляются в Telegram
 VK_UPLOAD = True  # Если True — файлы загружаются в VK кабинеты
+PROMOUSER_UPLOAD = True  # Если True — запускается max_checker (проверка номеров через promouser.com)
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 PHONE = os.getenv("PHONE")
@@ -220,13 +221,14 @@ def send_error_sync(message: str):
 
 async def send_error_async(message: str):
     """Асинхронная отправка ошибки (используется в async коде).
-       Отправка без звука (disable_notification)."""
+       Отправка без звука (disable_notification). Таймаут 15с — не блокирует основной поток."""
     if not ERROR_BOT_TOKEN or not ERROR_CHAT_ID:
         logging.warning(f"ERROR BOT not configured, would send: {message}")
         return
     try:
         url = _bot_api_url(ERROR_BOT_TOKEN, "sendMessage")
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(connect=15, total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             await session.post(
                 url,
                 data={"chat_id": ERROR_CHAT_ID, "text": f"ERROR /bot_master.py : {message}", "disable_notification": "true"},
@@ -435,12 +437,16 @@ def process_csv_files(files):
 
 
 async def send_file_to_telegram(file_path: str, chat_id: str = CHAT_ID):
-    """Отправка файла в Telegram (основной бот). Отправка без звука (disable_notification)."""
+    """Отправка файла в Telegram (основной бот). Отправка без звука (disable_notification).
+    Таймаут 60с на подключение + 120с на передачу файла.
+    При любой ошибке логируем и возвращаемся — VK-загрузка не блокируется.
+    """
     if not BOT_TOKEN or not chat_id:
         logging.warning("Telegram BOT_TOKEN or CHAT_ID not configured")
         return
     url = _bot_api_url(BOT_TOKEN, "sendDocument")
-    async with aiohttp.ClientSession() as session:
+    timeout = aiohttp.ClientTimeout(connect=15, total=120)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         try:
             with open(file_path, "rb") as f:
                 form = aiohttp.FormData()
@@ -741,13 +747,15 @@ async def main():
 
     # 5.1) Запускаем max_checker параллельно (формирование файлов для проверки номеров)
     checker_task = None
-    if MAX_CHECKER_AVAILABLE:
+    if PROMOUSER_UPLOAD and MAX_CHECKER_AVAILABLE:
         try:
             checker_task = start_checker_task()
             logging.info("🔍 Запущен max_checker в фоновом режиме")
         except Exception as e:
             logging.exception("Ошибка запуска max_checker")
             await send_error_async(f"Ошибка запуска max_checker: {e}")
+    elif not PROMOUSER_UPLOAD:
+        logging.info("⏭️ max_checker пропущен (PROMOUSER_UPLOAD=False)")
 
     # 6) Подготавливаем общий список файлов, которые надо:
     #    - СНАЧАЛА отправить в TG (все)
