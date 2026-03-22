@@ -14,8 +14,6 @@ from datetime import datetime, timedelta
 from telethon import TelegramClient
 from collections import defaultdict
 
-VersionBotMaster = "2.9"
-
 # Импорт модуля проверки номеров
 try:
     from max_checker import start_checker_task
@@ -48,15 +46,48 @@ def _proxy_headers() -> dict:
 
 
 def _telethon_proxy():
-    """Возвращает параметр proxy для TelegramClient (MTProto) или None."""
-    if TG_MTPROTO_HOST and TG_MTPROTO_SECRET:
-        from telethon.network.connection.tcpmtproxy import ConnectionTcpMTProxyRandomizedIntermediate
-        return dict(
-            proxy=(TG_MTPROTO_HOST, TG_MTPROTO_PORT, TG_MTPROTO_SECRET),
-            connection=ConnectionTcpMTProxyRandomizedIntermediate,
-        )
-    return None
+    """
+    Возвращает kwargs для TelegramClient с MTProto прокси или None.
 
+    Тип соединения определяется по префиксу секрета:
+      - ee...  → ConnectionTcpMTProxyRandomizedIntermediate
+      - dd...  → ConnectionTcpMTProxyIntermediate  (FakeTLS, обычный hex)
+      - иначе  → ConnectionTcpMTProxyIntermediate
+
+    Ошибка "readexactly size can not be less than zero" означает несовпадение
+    типа соединения — проверьте префикс секрета из ссылки t.me/proxy?secret=...
+    """
+    if not (TG_MTPROTO_HOST and TG_MTPROTO_SECRET):
+        return None
+
+    from telethon.network.connection.tcpmtproxy import (
+        ConnectionTcpMTProxyIntermediate,
+        ConnectionTcpMTProxyRandomizedIntermediate,
+    )
+
+    # Определяем тип по префиксу секрета.
+    # Стандарт: ee → Randomized, dd/hex → Intermediate.
+    # Однако если сервер настроен иначе, можно переопределить через .env:
+    #   TG_MTPROTO_CONN=intermediate  (или: randomized)
+    secret = TG_MTPROTO_SECRET.lower()
+    conn_override = os.getenv("TG_MTPROTO_CONN", "").lower()
+
+    if conn_override == "intermediate":
+        conn_cls = ConnectionTcpMTProxyIntermediate
+    elif conn_override == "randomized":
+        conn_cls = ConnectionTcpMTProxyRandomizedIntermediate
+    elif secret.startswith("ee"):
+        conn_cls = ConnectionTcpMTProxyRandomizedIntermediate
+    else:
+        conn_cls = ConnectionTcpMTProxyIntermediate
+
+    return dict(
+        proxy=(TG_MTPROTO_HOST, TG_MTPROTO_PORT, TG_MTPROTO_SECRET),
+        connection=conn_cls,
+    )
+
+
+VersionBotMaster = "2.91"
 # === Настройки ===
 DOWNLOAD_FROM_TG = True  # Если True — скачиваем CSV из Telegram, если False — берём TXT из /opt/bot/txt/
 SEND_FILES_TO_TELEGRAM = True  # Если True — файлы отправляются в Telegram
