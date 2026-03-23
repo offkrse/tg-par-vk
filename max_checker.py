@@ -16,24 +16,7 @@ from dotenv import load_dotenv
 
 load_dotenv("/opt/bot/.env")
 
-# === Прокси для Telegram ===
-_TG_PROXY_URL = os.getenv("TG_PROXY_URL", "").rstrip("/")
-_TG_PROXY_SECRET = os.getenv("TG_PROXY_SECRET", "")
-
-
-def _bot_api_url(token: str, method: str) -> str:
-    if _TG_PROXY_URL:
-        return f"{_TG_PROXY_URL}/bot{token}/{method}"
-    return f"https://api.telegram.org/bot{token}/{method}"
-
-
-def _proxy_headers() -> dict:
-    if _TG_PROXY_SECRET:
-        return {"X-Proxy-Secret": _TG_PROXY_SECRET}
-    return {}
-
-
-VERSION_MAX_CHECKER = "1.3"
+VERSION_MAX_CHECKER = "1.31"
 
 # === Настройки ===
 PROMO_CHECKER_KEY = os.getenv("PROMO_CHECKER_KEY", "")
@@ -57,6 +40,21 @@ DEFAULT_USD_RUB_RATE = 90.0
 # Фильтр по активности (дней с последнего логина)
 MAX_ACTIVE_DAYS_AGO = 20
 
+# === Прокси для Telegram ===
+_TG_PROXY_URL = os.getenv("TG_PROXY_URL", "").rstrip("/")
+_TG_PROXY_SECRET = os.getenv("TG_PROXY_SECRET", "")
+
+
+def _bot_api_url(token: str, method: str) -> str:
+    if _TG_PROXY_URL:
+        return f"{_TG_PROXY_URL}/bot{token}/{method}"
+    return f"https://api.telegram.org/bot{token}/{method}"
+
+
+def _proxy_headers() -> dict:
+    if _TG_PROXY_SECRET:
+        return {"X-Proxy-Secret": _TG_PROXY_SECRET}
+    return {}
 
 def get_usd_rub_rate() -> float:
     """Получает текущий курс USD/RUB"""
@@ -874,12 +872,12 @@ async def run_max_checker():
     if order_id1 is not None:
         tasks.append(collect_and_send_result(
             order_id1, lines_count1, "pack1",
-            f"max_ids_clean_{date_str}.txt", balance_before,
+            f"1max_ids_pack1_{date_str}.txt", balance_before,
         ))
     if order_id2 is not None:
         tasks.append(collect_and_send_result(
             order_id2, lines_count2, "pack2",
-            f"max_ids_pack2_{date_str}.txt", balance_before,
+            f"2max_ids_pack2_{date_str}.txt", balance_before,
         ))
 
     if tasks:
