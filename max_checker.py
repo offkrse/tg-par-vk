@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 load_dotenv("/opt/bot/.env")
 
-VERSION_MAX_CHECKER = "1.31"
+VERSION_MAX_CHECKER = "1.32"
 
 # === Настройки ===
 PROMO_CHECKER_KEY = os.getenv("PROMO_CHECKER_KEY", "")
@@ -39,6 +39,13 @@ DEFAULT_USD_RUB_RATE = 90.0
 
 # Фильтр по активности (дней с последнего логина)
 MAX_ACTIVE_DAYS_AGO = 20
+
+# Список паков для запуска. Допустимые значения: "pack1", "pack2"
+# Примеры:
+#   ALLOWED_PACKS = ["pack1", "pack2"]  — запустить оба пака
+#   ALLOWED_PACKS = ["pack1"]           — только pack1
+#   ALLOWED_PACKS = ["pack2"]           — только pack2
+ALLOWED_PACKS: List[str] = ["pack1"]
 
 # === Прокси для Telegram ===
 _TG_PROXY_URL = os.getenv("TG_PROXY_URL", "").rstrip("/")
@@ -845,26 +852,34 @@ async def run_max_checker():
 
     balance_before = check_balance() or 0.0
 
-    # ── Шаг 1: подготовка и загрузка pack1 ──────────────────────────────────
-    logger.info("[pack1] Подготовка файла...")
-    file_path1, lines_count1, phones_ac1 = create_non_check_files()
+    logger.info(f"Активные паки: {ALLOWED_PACKS}")
 
+    # ── Шаг 1: подготовка и загрузка pack1 ──────────────────────────────────
     order_id1: Optional[int] = None
-    if file_path1 and lines_count1 > 0:
-        order_id1 = await submit_order(file_path1, phones_ac1, "pack1")
+    lines_count1: int = 0
+    if "pack1" in ALLOWED_PACKS:
+        logger.info("[pack1] Подготовка файла...")
+        file_path1, lines_count1, phones_ac1 = create_non_check_files()
+        if file_path1 and lines_count1 > 0:
+            order_id1 = await submit_order(file_path1, phones_ac1, "pack1")
+        else:
+            logger.info("[pack1] Нет номеров для проверки")
     else:
-        logger.info("[pack1] Нет номеров для проверки")
+        logger.info("[pack1] Пропущен (не в ALLOWED_PACKS)")
 
     # ── Шаг 2: подготовка и загрузка pack2 ──────────────────────────────────
     # Запускается сразу после отправки pack1, не ожидая результата от promouser
-    logger.info("[pack2] Подготовка файла...")
-    file_path2, lines_count2, phones_ac2 = create_non_check_files_pack2()
-
     order_id2: Optional[int] = None
-    if file_path2 and lines_count2 > 0:
-        order_id2 = await submit_order(file_path2, phones_ac2, "pack2")
+    lines_count2: int = 0
+    if "pack2" in ALLOWED_PACKS:
+        logger.info("[pack2] Подготовка файла...")
+        file_path2, lines_count2, phones_ac2 = create_non_check_files_pack2()
+        if file_path2 and lines_count2 > 0:
+            order_id2 = await submit_order(file_path2, phones_ac2, "pack2")
+        else:
+            logger.info("[pack2] Нет номеров для проверки")
     else:
-        logger.info("[pack2] Нет номеров для проверки")
+        logger.info("[pack2] Пропущен (не в ALLOWED_PACKS)")
 
     # ── Шаг 3: параллельное ожидание и отправка результатов в ТГ ────────────
     # Каждый pack отправляется в ТГ как только готов, независимо от другого
