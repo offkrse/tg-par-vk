@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 load_dotenv("/opt/bot/.env")
 
-VERSION_MAX_CHECKER = "1.32"
+VERSION_MAX_CHECKER = "1.33"
 
 # === Настройки ===
 PROMO_CHECKER_KEY = os.getenv("PROMO_CHECKER_KEY", "")
@@ -46,6 +46,10 @@ MAX_ACTIVE_DAYS_AGO = 20
 #   ALLOWED_PACKS = ["pack1"]           — только pack1
 #   ALLOWED_PACKS = ["pack2"]           — только pack2
 ALLOWED_PACKS: List[str] = ["pack1"]
+
+# Если True  — паки отправляются в Promouser для проверки, результат приходит в ТГ.
+# Если False — паки НЕ отправляются в Promouser, файлы отправляются сразу в ТГ.
+SEND_TO_PROMOUSER: bool = True
 
 # === Прокси для Telegram ===
 _TG_PROXY_URL = os.getenv("TG_PROXY_URL", "").rstrip("/")
@@ -852,7 +856,30 @@ async def run_max_checker():
 
     balance_before = check_balance() or 0.0
 
-    logger.info(f"Активные паки: {ALLOWED_PACKS}")
+    logger.info(f"Активные паки: {ALLOWED_PACKS}, SEND_TO_PROMOUSER={SEND_TO_PROMOUSER}")
+
+    if not SEND_TO_PROMOUSER:
+        # ── Режим прямой отправки в ТГ (без Promouser) ──────────────────────
+        logger.info("SEND_TO_PROMOUSER=False — файлы отправляются сразу в ТГ")
+        for pack_name, create_fn, tg_filename in [
+            ("pack1", create_non_check_files,       f"1max_ids_pack1_{date_str}.txt"),
+            ("pack2", create_non_check_files_pack2, f"2max_ids_pack2_{date_str}.txt"),
+        ]:
+            if pack_name not in ALLOWED_PACKS:
+                logger.info(f"[{pack_name}] Пропущен (не в ALLOWED_PACKS)")
+                continue
+            logger.info(f"[{pack_name}] Подготовка файла...")
+            file_path, lines_count, phones_ac = create_fn()
+            if file_path and lines_count > 0:
+                save_already_checked(set(phones_ac))
+                logger.info(f"[{pack_name}] Записано в already_checked: {lines_count} номеров")
+                await send_telegram_message(f"📦 [{pack_name}] Готов файл: {lines_count} номеров (без Promouser)")
+                await send_telegram_file(file_path, custom_filename=tg_filename)
+                logger.info(f"[{pack_name}] Файл отправлен в ТГ напрямую: {file_path}")
+            else:
+                logger.info(f"[{pack_name}] Нет номеров для отправки")
+        logger.info("=== max_checker завершён (без Promouser) ===")
+        return
 
     # ── Шаг 1: подготовка и загрузка pack1 ──────────────────────────────────
     order_id1: Optional[int] = None
