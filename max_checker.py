@@ -45,11 +45,11 @@ MAX_ACTIVE_DAYS_AGO = 20
 #   ALLOWED_PACKS = ["pack1", "pack2"]  — запустить оба пака
 #   ALLOWED_PACKS = ["pack1"]           — только pack1
 #   ALLOWED_PACKS = ["pack2"]           — только pack2
-ALLOWED_PACKS: List[str] = ["pack1"]
+ALLOWED_PACKS: List[str] = ["pack1","pack2"]
 
 # Если True  — паки отправляются в Promouser для проверки, результат приходит в ТГ.
 # Если False — паки НЕ отправляются в Promouser, файлы отправляются сразу в ТГ.
-SEND_TO_PROMOUSER: bool = True
+SEND_TO_PROMOUSER: bool = False
 
 # === Прокси для Telegram ===
 _TG_PROXY_URL = os.getenv("TG_PROXY_URL", "").rstrip("/")
