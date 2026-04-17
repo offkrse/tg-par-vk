@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+"""
+bot_master.py v4.1
+──────────────────
+Изменения:
+  • Два TG-канала с независимыми окнами скачивания (UTC+4):
+      Канал 1 (CHANNEL_NAME):  07:03–07:06  →  UTC 03:03–03:06
+      Канал 2 (CHANNEL_NAME_2): 09:02–09:06  →  UTC 05:02–05:06
+  • Второй канал: только последние 2 CSV-файла
+      web_121_* → КБ21 (день).txt
+      web_122_* → КБ22 (день).txt
+  • Все TXT дедуплицируются (Set по номерам телефонов)
+  • VK-кабинеты и токены берутся из cabinets.json портала
+  • Для каждого кабинета и каждого файла — своё время выгрузки (fileSchedules)
+  • Глобальное расписание выгрузки убрано — всё управляется через портал
+  • Многоуровневый failover прокси для Telegram (WG+3proxy → WG+Dante → SSH → HTTP → direct)
+"""
+
 import os
 import asyncio
 import logging
@@ -8,13 +25,14 @@ import requests
 import boto3
 import aiohttp
 import time
-from typing import Any, Dict, Optional
+import json
+from typing import Any, Dict, Optional, List
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from telethon import TelegramClient
 from collections import defaultdict
 
-# Импорт модуля проверки номеров
+# ── Импорт max_checker (опционально) ─────────────────────────────────────────
 try:
     from max_checker import start_checker_task
     MAX_CHECKER_AVAILABLE = True
@@ -23,30 +41,229 @@ except ImportError:
 
 load_dotenv()
 
-# === Прокси для Telegram (обход блокировок) ===
-# Задать в .env:
-#   TG_PROXY_URL=http://195.133.9.79:8080   # HTTP-прокси для Bot API (sendMessage, sendDocument)
-#   TG_PROXY_SECRET=                        # опциональный секрет для HTTP прокси
+# ══════════════════════════════════════════════════════════════════════════════
+# === ТЕСТ-РЕЖИМ ==============================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# Запуск: python bot_master.py --test  ИЛИ  BOT_MASTER_TEST_MODE=1
+import sys
+TEST_MODE = "--test" in sys.argv or os.getenv("BOT_MASTER_TEST_MODE", "") == "1"
+
+if TEST_MODE:
+    print("🧪 ТЕСТ-РЕЖИМ: скачиваем 1 файл → test.txt → загружаем в 1 кабинет")
+    logging.basicConfig(
+        stream=sys.stdout,
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        force=True,
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# === ПРОКСИ ДЛЯ TELEGRAM — МНОГОУРОВНЕВЫЙ FAILOVER ===========================
+# ══════════════════════════════════════════════════════════════════════════════
 #
-#   # SOCKS5 прокси для Telethon (скачивание CSV через MTProto):
-#   TG_SOCKS5_HOST=195.133.9.79
-#   TG_SOCKS5_PORT=1080
-#   TG_SOCKS5_USER=                         # если dante настроен с авторизацией
-#   TG_SOCKS5_PASS=
-TG_PROXY_URL    = os.getenv("TG_PROXY_URL", "").rstrip("/")
-TG_PROXY_SECRET = os.getenv("TG_PROXY_SECRET", "")
-TG_SOCKS5_HOST  = os.getenv("TG_SOCKS5_HOST", "")
+# Порядок попыток (от быстрого к надёжному):
+#   1. WireGuard + 3proxy SOCKS5     (TG_SOCKS5_HOST / TG_SOCKS5_PORT)
+#   2. WireGuard + Dante SOCKS5      (TG_FALLBACK_SOCKS5_HOST / TG_FALLBACK_SOCKS5_PORT)
+#   3. SSH reverse tunnel SOCKS5     (TG_SSH_USER / TG_SSH_KEY_PATH / TG_SSH_TUNNEL_LOCAL_PORT)
+#   4. HTTP прокси на relay сервере  (TG_PROXY_URL)
+#   5. Прямое подключение            (только если relay недоступен совсем)
+#
+# Все прокси слушают на WireGuard-интерфейсе relay-сервера — снаружи закрыты.
+# ══════════════════════════════════════════════════════════════════════════════
+
+import subprocess
+import socket
+import threading
+
+# ── Прокси 1: WireGuard + 3proxy (основной) ──────────────────────────────────
+TG_SOCKS5_HOST  = os.getenv("TG_SOCKS5_HOST", "")        # 10.99.0.1
 TG_SOCKS5_PORT  = int(os.getenv("TG_SOCKS5_PORT", "1080"))
 TG_SOCKS5_USER  = os.getenv("TG_SOCKS5_USER", "")
 TG_SOCKS5_PASS  = os.getenv("TG_SOCKS5_PASS", "")
 
-USE_TG_PROXY = bool(TG_PROXY_URL or TG_SOCKS5_HOST)
+# ── Прокси 2: WireGuard + Dante (fallback) ────────────────────────────────────
+TG_FALLBACK_SOCKS5_HOST = os.getenv("TG_FALLBACK_SOCKS5_HOST", "")  # 10.99.0.1
+TG_FALLBACK_SOCKS5_PORT = int(os.getenv("TG_FALLBACK_SOCKS5_PORT", "1081"))
+TG_FALLBACK_SOCKS5_USER = os.getenv("TG_FALLBACK_SOCKS5_USER", "")
+TG_FALLBACK_SOCKS5_PASS = os.getenv("TG_FALLBACK_SOCKS5_PASS", "")
+
+# ── Прокси 3: SSH reverse tunnel ─────────────────────────────────────────────
+TG_SSH_USER         = os.getenv("TG_SSH_USER", "root")
+TG_SSH_HOST         = os.getenv("RELAY_HOST", "")         # 94.103.178.200
+TG_SSH_PORT         = int(os.getenv("RELAY_SSH_PORT", "22222"))
+TG_SSH_KEY_PATH     = os.getenv("TG_SSH_KEY_PATH", "/root/.ssh/relay_key")
+TG_SSH_TUNNEL_PORT  = int(os.getenv("TG_SSH_TUNNEL_LOCAL_PORT", "9050"))
+
+# ── Прокси 4: HTTP прокси (legacy/опциональный) ───────────────────────────────
+TG_PROXY_URL    = os.getenv("TG_PROXY_URL", "").rstrip("/")
+TG_PROXY_SECRET = os.getenv("TG_PROXY_SECRET", "")
+
+# ── Глобальный активный прокси (выбирается при старте) ───────────────────────
+_active_proxy: Optional[dict] = None   # {'type': 'socks5'|'ssh'|'http'|'direct', ...}
+_ssh_tunnel_proc: Optional[subprocess.Popen] = None
+_proxy_lock = threading.Lock()
+
+
+def _is_port_open(host: str, port: int, timeout: float = 3.0) -> bool:
+    """Проверяет что TCP-порт открыт."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _test_socks5(host: str, port: int, user: str = "", password: str = "") -> bool:
+    """Быстро проверяет что SOCKS5-прокси работает (подключение к api.telegram.org)."""
+    try:
+        import socks
+        s = socks.socksocket()
+        s.set_proxy(socks.SOCKS5, host, port, True,
+                    user or None, password or None)
+        s.settimeout(5)
+        s.connect(("api.telegram.org", 443))
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
+def _start_ssh_tunnel() -> bool:
+    """
+    Поднимает SSH dynamic SOCKS5 туннель к relay-серверу.
+    ssh -D 127.0.0.1:TG_SSH_TUNNEL_PORT -N -o StrictHostKeyChecking=no ...
+    Возвращает True если туннель поднялся.
+    """
+    global _ssh_tunnel_proc
+
+    if not TG_SSH_HOST or not os.path.exists(TG_SSH_KEY_PATH):
+        return False
+
+    # Завершаем старый процесс если есть
+    if _ssh_tunnel_proc and _ssh_tunnel_proc.poll() is None:
+        _ssh_tunnel_proc.terminate()
+
+    cmd = [
+        "ssh",
+        "-D", f"127.0.0.1:{TG_SSH_TUNNEL_PORT}",
+        "-N",                                     # не выполнять команды
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ServerAliveInterval=30",
+        "-o", "ServerAliveCountMax=3",
+        "-o", "ConnectTimeout=10",
+        "-o", "ExitOnForwardFailure=yes",
+        "-i", TG_SSH_KEY_PATH,
+        "-p", str(TG_SSH_PORT),
+        f"{TG_SSH_USER}@{TG_SSH_HOST}",
+    ]
+
+    try:
+        _ssh_tunnel_proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Даём туннелю 3 секунды на поднятие
+        import time as _time
+        for _ in range(6):
+            _time.sleep(0.5)
+            if _ssh_tunnel_proc.poll() is not None:
+                return False  # процесс завершился с ошибкой
+            if _is_port_open("127.0.0.1", TG_SSH_TUNNEL_PORT, timeout=1):
+                return True
+        return _is_port_open("127.0.0.1", TG_SSH_TUNNEL_PORT)
+    except Exception as e:
+        logging.warning("SSH tunnel error: %s", e)
+        return False
+
+
+def _stop_ssh_tunnel():
+    """Завершает SSH-туннель."""
+    global _ssh_tunnel_proc
+    if _ssh_tunnel_proc and _ssh_tunnel_proc.poll() is None:
+        _ssh_tunnel_proc.terminate()
+        _ssh_tunnel_proc = None
+
+
+def select_proxy() -> dict:
+    """
+    Определяет рабочий прокси, пробуя каждый уровень по очереди.
+    Возвращает dict с описанием активного прокси.
+    Кэширует результат в _active_proxy.
+    """
+    global _active_proxy
+
+    with _proxy_lock:
+        # ── Уровень 1: WireGuard + 3proxy ────────────────────────────────────
+        if TG_SOCKS5_HOST:
+            if _test_socks5(TG_SOCKS5_HOST, TG_SOCKS5_PORT,
+                            TG_SOCKS5_USER, TG_SOCKS5_PASS):
+                logging.info("🟢 Прокси: 3proxy SOCKS5 (%s:%d)",
+                             TG_SOCKS5_HOST, TG_SOCKS5_PORT)
+                _active_proxy = {
+                    "type": "socks5",
+                    "host": TG_SOCKS5_HOST, "port": TG_SOCKS5_PORT,
+                    "user": TG_SOCKS5_USER, "pass": TG_SOCKS5_PASS,
+                    "label": "3proxy/WireGuard",
+                }
+                return _active_proxy
+            else:
+                logging.warning("🔴 3proxy SOCKS5 недоступен (%s:%d)",
+                                TG_SOCKS5_HOST, TG_SOCKS5_PORT)
+
+        # ── Уровень 2: WireGuard + Dante ─────────────────────────────────────
+        if TG_FALLBACK_SOCKS5_HOST:
+            if _test_socks5(TG_FALLBACK_SOCKS5_HOST, TG_FALLBACK_SOCKS5_PORT,
+                            TG_FALLBACK_SOCKS5_USER, TG_FALLBACK_SOCKS5_PASS):
+                logging.info("🟡 Прокси: Dante SOCKS5 (%s:%d)",
+                             TG_FALLBACK_SOCKS5_HOST, TG_FALLBACK_SOCKS5_PORT)
+                _active_proxy = {
+                    "type": "socks5",
+                    "host": TG_FALLBACK_SOCKS5_HOST,
+                    "port": TG_FALLBACK_SOCKS5_PORT,
+                    "user": TG_FALLBACK_SOCKS5_USER,
+                    "pass": TG_FALLBACK_SOCKS5_PASS,
+                    "label": "Dante/WireGuard",
+                }
+                return _active_proxy
+            else:
+                logging.warning("🔴 Dante SOCKS5 недоступен (%s:%d)",
+                                TG_FALLBACK_SOCKS5_HOST, TG_FALLBACK_SOCKS5_PORT)
+
+        # ── Уровень 3: SSH dynamic SOCKS5 ────────────────────────────────────
+        if TG_SSH_HOST and os.path.exists(TG_SSH_KEY_PATH):
+            logging.info("🟡 Пробуем SSH туннель к %s:%d...", TG_SSH_HOST, TG_SSH_PORT)
+            if _start_ssh_tunnel():
+                logging.info("🟡 Прокси: SSH dynamic SOCKS5 (127.0.0.1:%d)",
+                             TG_SSH_TUNNEL_PORT)
+                _active_proxy = {
+                    "type": "socks5",
+                    "host": "127.0.0.1",
+                    "port": TG_SSH_TUNNEL_PORT,
+                    "user": "", "pass": "",
+                    "label": "SSH-tunnel",
+                }
+                return _active_proxy
+            else:
+                logging.warning("🔴 SSH туннель не поднялся")
+
+        # ── Уровень 4: HTTP прокси ────────────────────────────────────────────
+        if TG_PROXY_URL:
+            logging.info("🟡 Прокси: HTTP (%s)", TG_PROXY_URL)
+            _active_proxy = {"type": "http", "url": TG_PROXY_URL, "label": "HTTP"}
+            return _active_proxy
+
+        # ── Уровень 5: прямое подключение ────────────────────────────────────
+        logging.warning("⚠️  Все прокси недоступны — прямое подключение")
+        _active_proxy = {"type": "direct", "label": "direct"}
+        return _active_proxy
 
 
 def _bot_api_url(token: str, method: str) -> str:
-    """Возвращает URL для Bot API — через HTTP-прокси или напрямую."""
-    if TG_PROXY_URL:
-        return f"{TG_PROXY_URL}/bot{token}/{method}"
+    """URL для Bot API с учётом активного прокси."""
+    proxy = _active_proxy or {}
+    if proxy.get("type") == "http" and proxy.get("url"):
+        return f"{proxy['url']}/bot{token}/{method}"
     return f"https://api.telegram.org/bot{token}/{method}"
 
 
@@ -56,187 +273,252 @@ def _proxy_headers() -> dict:
     return {}
 
 
-def _telethon_proxy():
+def _aiohttp_connector():
     """
-    Возвращает kwargs для TelegramClient с SOCKS5 прокси или None.
-    Telethon использует python-socks для SOCKS5.
-    Требует: pip install pysocks
+    Возвращает aiohttp-коннектор с поддержкой SOCKS5.
+    Требует aiohttp-socks: pip install aiohttp-socks
     """
-    if not TG_SOCKS5_HOST:
+    proxy = _active_proxy or {}
+    if proxy.get("type") == "socks5":
+        try:
+            from aiohttp_socks import ProxyConnector, ProxyType
+            user = proxy.get("user") or None
+            password = proxy.get("pass") or None
+            if user:
+                conn = ProxyConnector(
+                    proxy_type=ProxyType.SOCKS5,
+                    host=proxy["host"], port=proxy["port"],
+                    username=user, password=password,
+                    rdns=True,
+                )
+            else:
+                conn = ProxyConnector(
+                    proxy_type=ProxyType.SOCKS5,
+                    host=proxy["host"], port=proxy["port"],
+                    rdns=True,
+                )
+            return conn
+        except ImportError:
+            logging.warning("aiohttp-socks не установлен, HTTP прокси не работает для aiohttp")
+    return None
+
+
+def _telethon_proxy() -> Optional[dict]:
+    """Возвращает kwargs для TelegramClient."""
+    proxy = _active_proxy or {}
+    if proxy.get("type") != "socks5":
+        return None
+    try:
+        import socks
+        return dict(proxy=(
+            socks.SOCKS5,
+            proxy["host"], proxy["port"],
+            True,
+            proxy.get("user") or None,
+            proxy.get("pass") or None,
+        ))
+    except ImportError:
+        logging.error("PySocks не установлен: pip install pysocks")
         return None
 
-    import socks
-    proxy = (
-        socks.SOCKS5,
-        TG_SOCKS5_HOST,
-        TG_SOCKS5_PORT,
-        True,
-        TG_SOCKS5_USER or None,
-        TG_SOCKS5_PASS or None,
-    )
-    return dict(proxy=proxy)
+
+async def ensure_proxy():
+    """
+    Вызывается перед каждым обращением к Telegram.
+    Если активный прокси не работает — переключается на следующий.
+    """
+    global _active_proxy
+
+    current = _active_proxy
+    if current is None:
+        select_proxy()
+        return
+
+    # Быстрая проверка текущего прокси
+    if current.get("type") == "socks5":
+        ok = _test_socks5(
+            current["host"], current["port"],
+            current.get("user", ""), current.get("pass", "")
+        )
+        if not ok:
+            logging.warning("Прокси %s перестал работать, переключаемся...",
+                            current.get("label"))
+            _active_proxy = None
+            select_proxy()
+    elif current.get("type") == "direct":
+        # Если был direct — пробуем снова поднять прокси
+        _active_proxy = None
+        select_proxy()
 
 
-VersionBotMaster = "3.1"
-# === Настройки ===
-DOWNLOAD_FROM_TG = True  # Если True — скачиваем CSV из Telegram, если False — берём TXT из /opt/bot/txt/
-SEND_FILES_TO_TELEGRAM = True  # Если True — файлы отправляются в Telegram
-VK_UPLOAD = True  # Если True — файлы загружаются в VK кабинеты
-PROMOUSER_UPLOAD = True  # Если True — запускается max_checker (проверка номеров через promouser.com)
-API_ID = os.getenv("API_ID")
-API_HASH = os.getenv("API_HASH")
-PHONE = os.getenv("PHONE")
-CHANNEL_NAME = os.getenv("CHANNEL_NAME")
+# ══════════════════════════════════════════════════════════════════════════════
+# === НАСТРОЙКИ ================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+VersionBotMaster = "4.1"
 
-S3_BUCKET = os.getenv("S3_BUCKET")
-S3_ENDPOINT = os.getenv("S3_ENDPOINT")
+SEND_FILES_TO_TELEGRAM = True
+VK_UPLOAD = True
+PROMOUSER_UPLOAD = True
+
+API_ID        = os.getenv("API_ID")
+API_HASH      = os.getenv("API_HASH")
+PHONE         = os.getenv("PHONE")
+
+# Канал 1 — основной (скачиваем все CSV кроме 389/390)
+CHANNEL_NAME  = os.getenv("CHANNEL_NAME")
+
+# Канал 2 — дополнительный (только 2 последних файла web_121_* / web_122_*)
+CHANNEL_NAME_2 = os.getenv("CHANNEL_NAME_2", "")
+
+S3_BUCKET     = os.getenv("S3_BUCKET")
+S3_ENDPOINT   = os.getenv("S3_ENDPOINT")
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY")
 
-# Второй (резервный/отдельный) бакет, из которого читаем new_subs_...txt из корня
-NEW_S3_BUCKET = os.getenv("NEW_S3_BUCKET")
-NEW_S3_ENDPOINT = os.getenv("NEW_S3_ENDPOINT")
+NEW_S3_BUCKET     = os.getenv("NEW_S3_BUCKET")
+NEW_S3_ENDPOINT   = os.getenv("NEW_S3_ENDPOINT")
 NEW_S3_ACCESS_KEY = os.getenv("NEW_S3_ACCESS_KEY")
 NEW_S3_SECRET_KEY = os.getenv("NEW_S3_SECRET_KEY")
 
-# поддержка нескольких токенов через CSV-вход в .env
-# VK_ACCESS_TOKENS = token1,token2,token3
-VK_ACCESS_TOKENS = [t.strip() for t in os.getenv("VK_ACCESS_TOKEN", "").split(",") if t.strip()]
+BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID")
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-# error bot
 ERROR_BOT_TOKEN = os.getenv("ERROR_BOT_TOKEN")
-ERROR_CHAT_ID = os.getenv("ERROR_CHAT_ID")
+ERROR_CHAT_ID   = os.getenv("ERROR_CHAT_ID")
 
-BASE_DATE = datetime(2025, 7, 14)
+# Путь к cabinets.json портала
+CABINETS_JSON = os.getenv("CABINETS_JSON", "/opt/portal/backend/data/cabinets.json")
+
+# Путь к list_base.json портала — прямая перезапись файла (без HTTP и токенов)
+# Портал и bot_master работают на одном сервере, файл читается при каждом запросе
+LIST_BASE_JSON = os.getenv("LIST_BASE_JSON", "/opt/portal/backend/data/list_base.json")
+
+# Нумерация дней
+BASE_DATE   = datetime(2025, 7, 14)
 BASE_NUMBER = 53
 
-# === Логирование ===
+# Окна скачивания по UTC (сервер работает по UTC, пользователь задаёт UTC+4)
+# Канал 1: 07:03–07:06 UTC+4  →  03:03–03:06 UTC
+CHANNEL1_WINDOW_START = (3, 3)   # (час, минута) UTC
+CHANNEL1_WINDOW_END   = (3, 6)
+
+# Канал 2: 09:02–09:06 UTC+4  →  05:02–05:06 UTC
+CHANNEL2_WINDOW_START = (5, 2)
+CHANNEL2_WINDOW_END   = (5, 6)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# === ЛОГИРОВАНИЕ ==============================================================
+# ══════════════════════════════════════════════════════════════════════════════
 logging.basicConfig(
     filename="/opt/bot/bot_master.log",
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger("bot_master")
-# === S3 клиент ===
+
+# ══════════════════════════════════════════════════════════════════════════════
+# === S3 КЛИЕНТ ================================================================
+# ══════════════════════════════════════════════════════════════════════════════
 s3 = boto3.client(
     "s3",
-    endpoint_url=S3_ENDPOINT if S3_ENDPOINT else None,
+    endpoint_url=S3_ENDPOINT or None,
     aws_access_key_id=S3_ACCESS_KEY,
     aws_secret_access_key=S3_SECRET_KEY
 )
 
-# === VK API URLs ===
+# ══════════════════════════════════════════════════════════════════════════════
+# === VK API ===================================================================
+# ══════════════════════════════════════════════════════════════════════════════
 BASE_URL_V3 = "https://ads.vk.com/api/v3"
 BASE_URL_V2 = "https://ads.vk.com/api/v2"
 
-MAX_UPLOADS_PER_TOKEN = 20  # максимум загрузок на один кабинет
-VK_UPLOAD_COUNTERS = {}
+MAX_UPLOADS_PER_TOKEN = 20
+VK_UPLOAD_COUNTERS: Dict[str, int] = {}
 
-# === HTTP с повторами и обработкой rate limit ===
-RETRY_COUNT = 3
-RETRY_BACKOFF = 2
+RETRY_COUNT    = 3
+RETRY_BACKOFF  = 2
 RATE_LIMIT_SLEEP = (10, 30)
 
-def req_with_retry(
-    method: str,
-    url: str,
-    headers: Dict[str, str],
-    params: Optional[Dict[str, Any]] = None,
-    json_body: Optional[Dict[str, Any]] = None,
-    files: Optional[Dict[str, Any]] = None,
-    data: Optional[Dict[str, Any]] = None,
-    timeout: int = 60
-) -> requests.Response:
-    last_exc: Optional[Exception] = None
 
+def req_with_retry(
+    method: str, url: str, headers: Dict[str, str],
+    params=None, json_body=None, files=None, data=None, timeout=60
+) -> requests.Response:
+    last_exc = None
     for attempt in range(1, RETRY_COUNT + 1):
         try:
             resp = requests.request(
-                method, url,
-                headers=headers,
-                params=params,
-                json=json_body,
-                data=data,
-                files=files,
-                timeout=timeout
+                method, url, headers=headers, params=params,
+                json=json_body, data=data, files=files, timeout=timeout
             )
-
-            # === Обработка rate limit ===
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", "5"))
-                logger.warning(f"⚠️ VK API rate limit (429). Пауза {retry_after}s перед повтором...")
+                logger.warning(f"VK rate limit 429, пауза {retry_after}s")
                 time.sleep(retry_after)
                 continue
-
             try:
-                result = resp.json()
-                vk_error = result.get("error", {})
-                if isinstance(vk_error, dict) and vk_error.get("error_code") in (9, 29):
-                    sleep_for = random.uniform(*RATE_LIMIT_SLEEP)
-                    logger.warning(f"⚠️ VK flood control ({vk_error.get('error_code')}). "
-                                   f"Пауза {sleep_for:.1f}s перед повтором...")
-                    time.sleep(sleep_for)
+                vk_err = resp.json().get("error", {})
+                if isinstance(vk_err, dict) and vk_err.get("error_code") in (9, 29):
+                    sf = random.uniform(*RATE_LIMIT_SLEEP)
+                    logger.warning(f"VK flood {vk_err.get('error_code')}, пауза {sf:.1f}s")
+                    time.sleep(sf)
                     continue
             except Exception:
                 pass
-
             if resp.status_code >= 500:
                 raise requests.HTTPError(f"{resp.status_code} {resp.text}")
-
             return resp
-
         except Exception as e:
             last_exc = e
-            sleep_for = RETRY_BACKOFF ** (attempt - 1)
-            logger.warning(f"{method} {url} попытка {attempt}/{RETRY_COUNT} не удалась: {e}. "
-                           f"Повтор через {sleep_for:.1f}s")
-            time.sleep(sleep_for)
-
-    assert last_exc is not None
+            sf = RETRY_BACKOFF ** (attempt - 1)
+            logger.warning(f"{method} {url} попытка {attempt}/{RETRY_COUNT}: {e}. Повтор через {sf}s")
+            time.sleep(sf)
     raise last_exc
 
 
-# === Утилиты ===
+# ══════════════════════════════════════════════════════════════════════════════
+# === УТИЛИТЫ ==================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+
 def send_error_sync(message: str):
-    """Синхронная отправка ошибки error-ботом (используется в sync коде).
-       Отправка без звука (disable_notification)."""
     if not ERROR_BOT_TOKEN or not ERROR_CHAT_ID:
-        logging.warning(f"ERROR BOT not configured, would send: {message}")
+        logging.warning(f"ERROR BOT не настроен: {message}")
         return
     try:
         url = _bot_api_url(ERROR_BOT_TOKEN, "sendMessage")
-        resp = requests.post(
-            url,
-            data={"chat_id": ERROR_CHAT_ID, "text": f"ERROR /bot_master.py : {message}", "disable_notification": True},
-            headers=_proxy_headers()
-        )
-        if resp.status_code != 200:
-            logging.error(f"Не удалось отправить ошибку в error-bot: {resp.status_code} {resp.text}")
+        requests.post(url,
+            data={"chat_id": ERROR_CHAT_ID,
+                  "text": f"❌ bot_master v{VersionBotMaster}: {message}",
+                  "disable_notification": True},
+            headers=_proxy_headers(), timeout=15)
     except Exception as e:
-        logging.exception(f"Ошибка при отправке ошибки в error-bot: {e}")
+        logging.exception(f"send_error_sync failed: {e}")
 
 
 async def send_error_async(message: str):
-    """Асинхронная отправка ошибки (используется в async коде).
-       Отправка без звука (disable_notification). Таймаут 15с — не блокирует основной поток."""
     if not ERROR_BOT_TOKEN or not ERROR_CHAT_ID:
-        logging.warning(f"ERROR BOT not configured, would send: {message}")
+        logging.warning(f"ERROR BOT не настроен: {message}")
         return
     try:
         url = _bot_api_url(ERROR_BOT_TOKEN, "sendMessage")
         timeout = aiohttp.ClientTimeout(connect=15, total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            await session.post(
-                url,
-                data={"chat_id": ERROR_CHAT_ID, "text": f"ERROR /bot_master.py : {message}", "disable_notification": "true"},
-                headers=_proxy_headers()
-            )
+        connector = _aiohttp_connector()
+        if connector:
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                await session.post(url,
+                    data={"chat_id": ERROR_CHAT_ID,
+                          "text": f"❌ bot_master v{VersionBotMaster}: {message}",
+                          "disable_notification": "true"},
+                    headers=_proxy_headers())
+        else:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                await session.post(url,
+                    data={"chat_id": ERROR_CHAT_ID,
+                          "text": f"❌ bot_master v{VersionBotMaster}: {message}",
+                          "disable_notification": "true"},
+                    headers=_proxy_headers())
     except Exception:
-        logging.exception("Ошибка при send_error_async")
-        # fallback to sync
+        logging.exception("send_error_async failed")
         send_error_sync(message)
 
 
@@ -245,7 +527,46 @@ def get_day_number(today: datetime) -> int:
     return BASE_NUMBER + delta
 
 
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def seconds_until_window(hour_utc: int, minute_utc: int) -> float:
+    """Секунд до следующего наступления HH:MM UTC."""
+    now = now_utc()
+    target = now.replace(hour=hour_utc, minute=minute_utc, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# === КАБИНЕТЫ ИЗ ПОРТАЛА =====================================================
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_cabinets() -> List[dict]:
+    """Читает список кабинетов из cabinets.json портала."""
+    if not os.path.exists(CABINETS_JSON):
+        logger.warning(f"cabinets.json не найден: {CABINETS_JSON}")
+        return []
+    try:
+        with open(CABINETS_JSON, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+        logger.warning(f"Неожиданный формат cabinets.json")
+        return []
+    except Exception as e:
+        logger.exception(f"Ошибка чтения cabinets.json: {e}")
+        return []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# === ЛОГИКА ИМЁ ФАЙЛОВ =======================================================
+# ══════════════════════════════════════════════════════════════════════════════
+
 def get_output_filename(file_name: str, day_number: int):
+    """Для CSV канала 1. Возвращает (output_name, group_key)."""
     if "MFO5" in file_name:
         return f"Б0 ({day_number}).txt", "Б0"
     elif "6_web" in file_name:
@@ -258,37 +579,114 @@ def get_output_filename(file_name: str, day_number: int):
         return None, None
 
 
-async def download_latest_csv(to_folder="/opt/bot/csv"):
-    """Скачивает CSV из Telegram в папку to_folder (убирает дубликаты по исходному имени файла).
-       Если задан TG_PROXY_SOCKS5_HOST — использует SOCKS5 прокси для обхода блокировок."""
-    await asyncio.sleep(random.uniform(2, 4))
+def broker_channel_group(cid: str, day_number: int) -> str:
+    mapping = {
+        "КР ДОП_3":  [915, 917, 918, 919],
+        "КР 1":      [12063],
+        "КР 2":      [11896],
+        "КР ДОП_4":  [3587, 7389, 7553, 8614, 8732],
+        "КР ДОП_5":  [9189, 9190, 9191, 9192, 9193, 9194, 9413, 9441, 9443, 9453, 9889, 9899],
+        "КР ДОП_6":  [10141, 10240, 11682, 11729],
+        "КР ДОП_8":  [12873],
+        "КР ДОП_9":  [16263],
+    }
+    for name, ids in mapping.items():
+        if cid and str(cid).isdigit() and int(cid) in ids:
+            return f"{name} ({day_number}).txt"
+    return f"КР ДОП_10 ({day_number}).txt"
+
+
+def get_ch2_output_filename(orig_name: str, day_number: int) -> Optional[str]:
+    """
+    Маппинг для канала 2:
+      web_121_* → КБ21 (день).txt
+      web_122_* → КБ22 (день).txt
+    """
+    base = orig_name.lower()
+    if "web_121" in base:
+        return f"КБ21 ({day_number}).txt"
+    elif "web_122" in base:
+        return f"КБ22 ({day_number}).txt"
+    return None
+
+
+def order_txt_files(files: List[str]) -> List[str]:
+    priority = [
+        "КР ДОП_10", "КР ДОП_9", "КР ДОП_8", "КР ДОП_7", "КР ДОП_6",
+        "КР ДОП_5",  "КР ДОП_4", "КР ДОП_3", "КР 2",     "КР 1",
+        "ББ ДОП_3",  "ББ ДОП_2", "ББ",        "Б1",       "Б0",
+        "КБ21",      "КБ22",
+    ]
+
+    def key(p):
+        name = os.path.basename(p)
+        base = name.rsplit(".", 1)[0]
+        if base.endswith(")"):
+            base = base.split(" (")[0]
+        try:
+            return priority.index(base)
+        except ValueError:
+            return len(priority) + 1000
+
+    return sorted(files, key=key)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# === СКАЧИВАНИЕ ИЗ TELEGRAM ==================================================
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def download_csv_from_channel(
+    channel: str,
+    to_folder: str,
+    limit: int = 7,
+    only_last_n: Optional[int] = None,
+    session_name: str = "session_master",
+) -> List[str]:
+    """
+    Скачивает CSV из указанного TG-канала.
+    Перед подключением проверяет и при необходимости переключает прокси.
+    only_last_n: если задано — скачиваем только последние N файлов.
+    """
+    global _active_proxy  # объявляем в начале функции — до любого использования
     os.makedirs(to_folder, exist_ok=True)
 
-    proxy_kwargs = _telethon_proxy() or {}
-    if proxy_kwargs:
-        logging.info("📥 Подключаемся к Telegram через MTProto прокси и скачиваем CSV в %s", to_folder)
-    else:
-        logging.info("📥 Подключаемся к Telegram напрямую и скачиваем CSV в %s", to_folder)
+    # Проверяем/обновляем прокси (с 3 попытками)
+    for attempt in range(1, 4):
+        await ensure_proxy()
+        proxy_kwargs = _telethon_proxy() or {}
+        proxy_label = (_active_proxy or {}).get("label", "direct")
+        logger.info("📥 Скачиваем из %s via %s (попытка %d)", channel, proxy_label, attempt)
 
-    client = TelegramClient("session_master", API_ID, API_HASH, **proxy_kwargs)
-    await client.start(PHONE)
+        try:
+            client = TelegramClient(session_name, API_ID, API_HASH, **proxy_kwargs)
+            await client.start(PHONE)
+            break  # успешно подключились
+        except Exception as e:
+            logger.warning("Подключение к TG не удалось (попытка %d): %s", attempt, e)
+            # Сбрасываем прокси чтобы select_proxy выбрал следующий
+            _active_proxy = None
+            if attempt == 3:
+                await send_error_async(f"Не удалось подключиться к TG за 3 попытки: {e}")
+                return []
+            await asyncio.sleep(5)
+    else:
+        return []
 
     today = datetime.today()
     date_suffix = today.strftime("(%d.%m)")
-    seen_names = set()
-    result_files = []
+    seen_names: set = set()
+    result_files: List[str] = []
 
     try:
-        async for msg in client.iter_messages(CHANNEL_NAME, limit=7):
+        async for msg in client.iter_messages(channel, limit=limit):
             try:
                 if msg.file and msg.file.name and msg.file.name.endswith(".csv"):
                     orig_name = msg.file.name
-                    #ДЛЯ ОТМЕНЫ ПРАВИЛА 389 и 390 УБРАТЬ 3 следующие строчки
                     if orig_name in ("389.csv", "390.csv"):
-                        logging.info("Пропускаем файл по имени: %s", orig_name)
+                        logger.info("Пропускаем файл по имени: %s", orig_name)
                         continue
                     if orig_name in seen_names:
-                        logging.info("Пропускаем дубликат по имени: %s", orig_name)
+                        logger.info("Пропускаем дубликат: %s", orig_name)
                         continue
                     seen_names.add(orig_name)
 
@@ -298,116 +696,140 @@ async def download_latest_csv(to_folder="/opt/bot/csv"):
                     if "6_web" in orig_name:
                         await asyncio.sleep(90)
                     result_files.append(path)
-                    logging.info("✅ Скачан %s", filename)
+                    logger.info("✅ Скачан %s", filename)
                     await asyncio.sleep(random.uniform(10, 20))
             except Exception as e:
-                logging.exception("Ошибка при скачивании одного сообщения")
-                await send_error_async(f"Ошибка при скачивании сообщения: {e}")
+                logger.exception("Ошибка при скачивании сообщения")
+                await send_error_async(f"Ошибка скачивания из {channel}: {e}")
     finally:
         await client.disconnect()
+
+    if only_last_n is not None and len(result_files) > only_last_n:
+        # Оставляем только последние N (они первые в iter_messages = свежие)
+        result_files = result_files[:only_last_n]
 
     return result_files
 
 
-def broker_channel_group(cid: str, day_number: int) -> str:
-    """Определяет название TXT файла по channel_id"""
-    cid = str(cid)
-    mapping = {
-        "КР ДОП_3": [915, 917, 918, 919],
-        "КР 1": [12063],
-        "КР 2": [11896],
-        "КР ДОП_4": [3587, 7389, 7553, 8614, 8732],
-        "КР ДОП_5": [9189, 9190, 9191, 9192, 9193, 9194, 9413, 9441, 9443, 9453, 9889, 9899],
-        "КР ДОП_6": [10141, 10240, 11682, 11729],
-        "КР ДОП_8": [12873],
-        "КР ДОП_9": [16263],
-    }
-    for name, ids in mapping.items():
-        if cid is None:
-            continue
-        if str(cid).isdigit() and int(cid) in ids:
-            return f"{name} ({day_number}).txt"
-    return f"КР ДОП_10 ({day_number}).txt"
+# ══════════════════════════════════════════════════════════════════════════════
+# === ОБРАБОТКА CSV → TXT =====================================================
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-def process_csv_files(files):
-    """Обработка CSV -> TXT, защита от пустых/отсутствующих phone, удаление дубликатов номеров."""
+def process_csv_files_ch1(files: List[str]) -> List[str]:
+    """Обработка CSV от канала 1 (старая логика + дедупликация)."""
     today = datetime.today()
     day_number = get_day_number(today)
-    output_data = defaultdict(set)
-    approve_phones = set()  # телефоны из 253.csv для LAL-файла
+    output_data: Dict[str, set] = defaultdict(set)
+    approve_phones: set = set()
 
     for file in files:
         try:
             df = pd.read_csv(file)
             fname = os.path.basename(file)
 
-            # Проверки: пустой, нет колонки phone или все phone пусты
-            if df.empty or "phone" not in df.columns or df["phone"].dropna().astype(str).str.strip().eq("").all():
-                msg = f"Пропущен пустой или некорректный CSV: {fname}"
-                logging.warning(msg)
+            if df.empty or "phone" not in df.columns or \
+               df["phone"].dropna().astype(str).str.strip().eq("").all():
+                msg = f"Пропущен пустой CSV: {fname}"
+                logger.warning(msg)
                 send_error_sync(msg)
                 continue
 
             output_name, group_key = get_output_filename(fname, day_number)
             if not group_key:
-                logging.info("Файл %s не подпадает под обработку (имя): %s", fname, group_key)
+                logger.info("Файл %s не подпадает под обработку", fname)
                 continue
 
             if group_key == "broker":
                 if "channel_id" not in df.columns:
-                    msg = f"В {fname} отсутствует column 'channel_id'"
-                    logging.warning(msg)
-                    send_error_sync(msg)
+                    send_error_sync(f"В {fname} нет channel_id")
                     continue
                 for _, row in df.iterrows():
                     phone = str(row.get("phone", "")).replace("+", "").strip()
-                    if not phone:
-                        continue
-                    cid = row.get("channel_id", "")
-                    txt_name = broker_channel_group(cid, day_number)
-                    output_data[txt_name].add(phone)
+                    if phone:
+                        cid = row.get("channel_id", "")
+                        output_data[broker_channel_group(str(cid), day_number)].add(phone)
 
             elif group_key == "6_web":
                 if "channel_id" not in df.columns:
-                    msg = f"В {fname} нет столбца channel_id"
-                    logging.warning(msg)
-                    send_error_sync(msg)
+                    send_error_sync(f"В {fname} нет channel_id")
                     continue
                 for _, row in df.iterrows():
                     phone = str(row.get("phone", "")).replace("+", "").strip()
                     if not phone:
                         continue
                     ch = str(row.get("channel_id", "")).strip()
-                    if ch == "15883":
-                        group = "ББ"
-                    elif ch == "15686":
-                        group = "ББ ДОП_1"
-                    elif ch == "15273":
-                        group = "ББ ДОП_2"
-                    else:
-                        group = "ББ ДОП_3"
+                    group = {"15883": "ББ", "15686": "ББ ДОП_1", "15273": "ББ ДОП_2"}.get(ch, "ББ ДОП_3")
                     output_data[f"{group} ({day_number}).txt"].add(phone)
 
             else:
-                phones = [str(p).replace("+", "").strip() for p in df["phone"].dropna()]
-                phones = [p for p in phones if p]
+                phones = [str(p).replace("+", "").strip() for p in df["phone"].dropna() if str(p).strip()]
                 if not phones:
-                    msg = f"Нет номеров в {fname}"
-                    logging.warning(msg)
-                    send_error_sync(msg)
+                    send_error_sync(f"Нет номеров в {fname}")
                     continue
                 if output_name:
                     output_data[output_name].update(phones)
-                # ДОП обработка: если это 253.csv → собираем телефоны отдельно
                 if "253" in fname:
                     approve_phones.update(phones)
 
+        except Exception as e:
+            msg = f"Ошибка обработки {file}: {e}"
+            logger.exception(msg)
+            send_error_sync(msg)
+
+    os.makedirs("/opt/bot/txt", exist_ok=True)
+    txt_files = []
+    for name, phones in output_data.items():
+        path = os.path.join("/opt/bot/txt", name)
+        # Дедупликация — phones уже Set
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(sorted(phones)))
+        txt_files.append(path)
+        logger.info("Сохранён TXT: %s (%d номеров)", name, len(phones))
+
+    if approve_phones:
+        os.makedirs("/opt/bot/txt_for_lal", exist_ok=True)
+        date_str = today.strftime("%d_%m_%Y")
+        approve_path = f"/opt/bot/txt_for_lal/b_approve_{date_str}.txt"
+        with open(approve_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(sorted(approve_phones)))
+        logger.info("Сохранён LAL файл: %s (%d номеров)", approve_path, len(approve_phones))
+
+    return txt_files
+
+
+def process_csv_files_ch2(files: List[str]) -> List[str]:
+    """
+    Обработка CSV от канала 2:
+      web_121_* → КБ21 (день).txt
+      web_122_* → КБ22 (день).txt
+    Дедупликация номеров внутри каждого файла.
+    """
+    today = datetime.today()
+    day_number = get_day_number(today)
+    output_data: Dict[str, set] = defaultdict(set)
+
+    for file in files:
+        try:
+            df = pd.read_csv(file)
+            fname = os.path.basename(file)
+
+            if df.empty or "phone" not in df.columns or \
+               df["phone"].dropna().astype(str).str.strip().eq("").all():
+                logger.warning("Пропущен пустой CSV (канал 2): %s", fname)
+                continue
+
+            out_name = get_ch2_output_filename(fname, day_number)
+            if not out_name:
+                logger.info("Файл %s не подпадает под обработку (канал 2)", fname)
+                continue
+
+            phones = [str(p).replace("+", "").strip() for p in df["phone"].dropna() if str(p).strip()]
+            output_data[out_name].update(phones)
+            logger.info("Обработан %s → %s (%d номеров)", fname, out_name, len(phones))
 
         except Exception as e:
-            msg = f"Ошибка при обработке {file}: {e}"
-            logging.exception(msg)
-            send_error_sync(msg)
+            logger.exception("Ошибка обработки %s: %s", file, e)
+            send_error_sync(f"Ошибка обработки CSV2 {file}: {e}")
 
     os.makedirs("/opt/bot/txt", exist_ok=True)
     txt_files = []
@@ -416,444 +838,635 @@ def process_csv_files(files):
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(sorted(phones)))
         txt_files.append(path)
-        logging.info("Сохранён TXT: %s (%d номеров)", name, len(phones))
-        
-    # === Сохранение b_approve_* в отдельную папку (НЕ в pipeline) ===
-    if approve_phones:
-        os.makedirs("/opt/bot/txt_for_lal", exist_ok=True)
-        date_str = today.strftime("%d_%m_%Y")
-        approve_path = f"/opt/bot/txt_for_lal/b_approve_{date_str}.txt"
-    
-        with open(approve_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(sorted(approve_phones)))
-    
-        logging.info(
-            "Сохранён LAL файл (НЕ идёт в S3/VK/TG): %s (%d номеров)",
-            approve_path,
-            len(approve_phones)
-        )
+        logger.info("Сохранён TXT (канал 2): %s (%d номеров)", name, len(phones))
 
     return txt_files
 
 
-async def send_file_to_telegram(file_path: str, chat_id: str = CHAT_ID):
-    """Отправка файла в Telegram (основной бот). Отправка без звука (disable_notification).
-    Таймаут 60с на подключение + 120с на передачу файла.
-    При любой ошибке логируем и возвращаемся — VK-загрузка не блокируется.
-    """
-    if not BOT_TOKEN or not chat_id:
-        logging.warning("Telegram BOT_TOKEN or CHAT_ID not configured")
-        return
-    url = _bot_api_url(BOT_TOKEN, "sendDocument")
-    timeout = aiohttp.ClientTimeout(connect=15, total=120)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        try:
-            with open(file_path, "rb") as f:
-                form = aiohttp.FormData()
-                form.add_field("chat_id", chat_id)
-                form.add_field("document", f)
-                form.add_field("disable_notification", "true")
-                async with session.post(
-                    url, data=form, headers=_proxy_headers()
-                ) as resp:
-                    if resp.status != 200:
-                        txt = await resp.text()
-                        msg = f"Ошибка Telegram API при отправке {file_path}: {resp.status} {txt}"
-                        logging.error(msg)
-                        await send_error_async(msg)
-        except Exception as e:
-            logging.exception("Ошибка при отправке файла в Telegram")
-            await send_error_async(f"Ошибка при отправке файла в Telegram {file_path}: {e}")
+# ══════════════════════════════════════════════════════════════════════════════
+# === S3 ======================================================================
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-def upload_to_s3(file_path):
-    """Загрузка в S3: txt -> /txt. CSV НЕ загружается (игнорируются)."""
+def upload_to_s3(file_path: str):
     filename = os.path.basename(file_path)
-    # загружаем только .txt
     if not filename.lower().endswith(".txt"):
-        logging.info("Пропускаем загрузку в S3 (не TXT): %s", filename)
         return
-    folder = "txt"
-    key = f"{folder}/{filename}"
+    key = f"txt/{filename}"
     try:
         s3.upload_file(file_path, S3_BUCKET, key)
-        logging.info("Загружен в S3: %s", key)
+        logger.info("Загружен в S3: %s", key)
     except Exception as e:
-        msg = f"Ошибка загрузки {filename} в S3: {e}"
-        logging.exception(msg)
+        msg = f"Ошибка загрузки в S3 {filename}: {e}"
+        logger.exception(msg)
         send_error_sync(msg)
 
 
-def upload_user_list_vk(file_path, list_name, vk_token, list_type="phones"):
-    """Загружает список в конкретный VK кабинет (token). Возвращает list_id."""
+def download_new_subs_from_s3(to_folder="/opt/bot/new_subs") -> Optional[str]:
+    if not NEW_S3_BUCKET:
+        return None
+    yesterday = datetime.today() - timedelta(days=1)
+    filename = f"new_subs_{yesterday.strftime('%d_%m_%Y')}.txt"
+    os.makedirs(to_folder, exist_ok=True)
+    local_path = os.path.join(to_folder, filename)
+    try:
+        client = boto3.client(
+            "s3",
+            endpoint_url=NEW_S3_ENDPOINT or S3_ENDPOINT or None,
+            aws_access_key_id=NEW_S3_ACCESS_KEY or S3_ACCESS_KEY,
+            aws_secret_access_key=NEW_S3_SECRET_KEY or S3_SECRET_KEY
+        )
+        client.download_file(NEW_S3_BUCKET, filename, local_path)
+        logger.info("Скачан new_subs: %s", filename)
+        return local_path
+    except Exception as e:
+        logger.exception("Ошибка скачивания new_subs: %s", e)
+        send_error_sync(f"Ошибка new_subs S3: {e}")
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# === TELEGRAM ОТПРАВКА =======================================================
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def send_file_to_telegram(file_path: str, chat_id: str = CHAT_ID):
+    if not BOT_TOKEN or not chat_id:
+        return
+
+    await ensure_proxy()
+    url = _bot_api_url(BOT_TOKEN, "sendDocument")
+    proxy_label = (_active_proxy or {}).get("label", "direct")
+    logger.info("📤 Отправка %s в TG via %s", os.path.basename(file_path), proxy_label)
+
+    timeout = aiohttp.ClientTimeout(connect=15, total=120)
+    connector = _aiohttp_connector()
+
+    async def _do_send(session):
+        with open(file_path, "rb") as f:
+            form = aiohttp.FormData()
+            form.add_field("chat_id", chat_id)
+            form.add_field("document", f)
+            form.add_field("disable_notification", "true")
+            async with session.post(url, data=form, headers=_proxy_headers()) as resp:
+                if resp.status != 200:
+                    txt = await resp.text()
+                    raise Exception(f"TG API {resp.status}: {txt}")
+
+    for attempt in range(1, 4):
+        try:
+            if connector:
+                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                    await _do_send(session)
+            else:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    await _do_send(session)
+            return  # успех
+        except Exception as e:
+            logger.warning("Ошибка отправки в TG (попытка %d): %s", attempt, e)
+            if attempt < 3:
+                global _active_proxy
+                _active_proxy = None
+                await ensure_proxy()
+                connector = _aiohttp_connector()
+                url = _bot_api_url(BOT_TOKEN, "sendDocument")
+                await asyncio.sleep(3)
+            else:
+                logger.exception("Не удалось отправить файл в TG")
+                await send_error_async(f"Ошибка отправки TG {file_path}: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# === VK ЗАГРУЗКА =============================================================
+# ══════════════════════════════════════════════════════════════════════════════
+
+def upload_user_list_vk(file_path: str, list_name: str, vk_token: str, list_type="phones") -> int:
     url = f"{BASE_URL_V3}/remarketing/users_lists.json"
     headers = {"Authorization": f"Bearer {vk_token}"}
     files = {"file": open(file_path, "rb")}
-    data = {"name": list_name, "type": list_type}
+    data  = {"name": list_name, "type": list_type}
     try:
         resp = req_with_retry("POST", url, headers=headers, files=files, data=data, timeout=60)
     finally:
         files["file"].close()
-
-    try:
-        result = resp.json()
-    except Exception:
-        raise Exception(f"Некорректный ответ VK: {resp.text}")
+    result = resp.json()
     if resp.status_code != 200 or isinstance(result.get("error"), dict):
-        raise Exception(f"Ошибка загрузки списка: {result}")
+        raise Exception(f"VK upload error: {result}")
     list_id = result.get("id")
     if not list_id:
-        raise Exception(f"Не удалось получить ID списка: {result}")
+        raise Exception(f"Нет list_id в ответе VK: {result}")
     return list_id
 
 
-def create_segment_vk(list_id, segment_name, vk_token):
-    """Создаёт сегмент в VK для конкретного кабинета."""
+def create_segment_vk(list_id: int, segment_name: str, vk_token: str) -> int:
     url = f"{BASE_URL_V2}/remarketing/segments.json"
     headers = {"Authorization": f"Bearer {vk_token}", "Content-Type": "application/json"}
     payload = {
         "name": segment_name,
         "pass_condition": 1,
-        "relations": [
-            {"object_type": "remarketing_users_list", "params": {"source_id": list_id, "type": "positive"}}
-        ],
+        "relations": [{"object_type": "remarketing_users_list",
+                        "params": {"source_id": list_id, "type": "positive"}}],
     }
     resp = req_with_retry("POST", url, headers=headers, json_body=payload, timeout=60)
     result = resp.json()
     if resp.status_code != 200 or isinstance(result.get("error"), dict):
-        raise Exception(f"Ошибка создания сегмента: {result}")
+        raise Exception(f"VK segment error: {result}")
     return result.get("id")
 
-async def upload_to_all_vk_and_get_one_sharing_key(file_path, vk_tokens, *, list_name=None, list_type="phones", segment_prefix="LAL "):
-    """
-    Загружает файл в каждый VK кабинет из vk_tokens.
-    Возвращает (first_success_list_id, first_token) для генерации единого sharing key (если надо).
-    Позволяет явно задать list_name/list_type и префикс сегмента.
-    """
-    file_name = os.path.basename(file_path)
-    base_list_name = os.path.splitext(file_name)[0]
-    list_name = list_name or base_list_name
-    segment_name = f"{segment_prefix}{list_name}"
 
-    first_success = None  # tuple (list_id, token)
-    for token in vk_tokens:
+async def upload_file_to_cabinets(
+    file_path: str,
+    cabinets: List[dict],
+    list_name: Optional[str] = None,
+    list_type: str = "phones",
+    segment_prefix: str = "LAL ",
+):
+    """
+    Загружает один TXT-файл в кабинеты, у которых эта база разрешена.
+    Фильтр: cabinet['bases'] — список разрешённых баз (пустой = все).
+    """
+    fname = os.path.basename(file_path)
+    base_name = os.path.splitext(fname)[0]
+    # Убираем суффикс " (NNN)" из имени базы для проверки прав
+    if base_name.endswith(")"):
+        base_short = base_name.rsplit(" (", 1)[0]
+    else:
+        base_short = base_name
+
+    effective_list_name = list_name or base_name
+    segment_name = f"{segment_prefix}{effective_list_name}"
+
+    for cabinet in cabinets:
+        token = cabinet.get("token", "")
+        if not token:
+            continue
+
+        # Проверяем разрешения: cabinet.bases пустой = все базы
+        allowed = cabinet.get("bases", [])
+        if allowed and base_short not in allowed:
+            logger.info("Кабинет «%s»: база «%s» не в списке разрешённых, пропускаем",
+                        cabinet.get("name"), base_short)
+            continue
+
         if token not in VK_UPLOAD_COUNTERS:
             VK_UPLOAD_COUNTERS[token] = 0
-
-        # 🔒 Проверка лимита
         if VK_UPLOAD_COUNTERS[token] >= MAX_UPLOADS_PER_TOKEN:
-            logging.warning(
-                f"⚠️ Превышен лимит {MAX_UPLOADS_PER_TOKEN} загрузок для VK кабинета {token[:8]}... Пропускаем."
-            )
+            logger.warning("Лимит загрузок для кабинета «%s»", cabinet.get("name"))
             continue
 
         try:
-            list_id = upload_user_list_vk(file_path, list_name, token, list_type=list_type)
+            list_id = upload_user_list_vk(file_path, effective_list_name, token, list_type=list_type)
             create_segment_vk(list_id, segment_name, token)
-            VK_UPLOAD_COUNTERS[token] += 1  # ✅ инкремент при успехе
-            logging.info("VK upload OK for token (truncated): %s ... list_id=%s", token[:8], list_id)
-            if first_success is None:
-                first_success = (list_id, token)
+            VK_UPLOAD_COUNTERS[token] += 1
+            logger.info("✅ VK upload: кабинет «%s» ← «%s» list_id=%s",
+                        cabinet.get("name"), fname, list_id)
         except Exception as e:
-            msg = f"Ошибка VK upload {file_name} для токена {token[:8]}: {e}"
-            logging.exception(msg)
+            msg = f"Ошибка VK upload «{fname}» → кабинет «{cabinet.get('name')}»: {e}"
+            logger.exception(msg)
             send_error_sync(msg)
 
-    return first_success
+        # Пауза между кабинетами
+        await asyncio.sleep(2)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# === ПЛАНИРОВЩИК ВЫГРУЗКИ В VK ===============================================
+# ══════════════════════════════════════════════════════════════════════════════
 
-def order_txt_files(files):
+async def vk_upload_scheduler(cabinets: List[dict], txt_files: List[str]):
     """
-    Возвращает отсортированный список txt по требуемому приоритету.
-    Оставляет только файлы, совпадающие с одним из ожидаемых префиксов.
+    Для каждого кабинета и каждого файла из fileSchedules запускает выгрузку
+    в заданное время (UTC+4, хранится как hour/minute UTC в cabinets.json после
+    пересчёта на фронтенде).
+
+    Ждём, пока не наступит нужное время, потом загружаем.
+    Все задачи идут параллельно через asyncio.gather.
     """
-    # Приоритетный список префиксов (сначала — более высокий приоритет)
-    # Для КР и Б префиксы могут содержать номер дня, уберём его при сравнении
-    priority = [
-        "КР ДОП_10", "КР ДОП_9", "КР ДОП_8", "КР ДОП_7", "КР ДОП_6",
-        "КР ДОП_5", "КР ДОП_4", "КР ДОП_3", "КР 2", "КР 1",
-        "ББ ДОП_3", "ББ ДОП_2", "ББ", "Б1", "Б0"
-    ]
+    tasks = []
 
-    def key_for_path(p):
-        name = os.path.basename(p)
-        # Удаляем расширение и возможный суффикс вида " (NN).txt"
-        base = name.rsplit(".", 1)[0]
-        # Уберём окончание " (число)" если есть
-        if base.endswith(")"):
-            # разделить по " (" и взять начало
-            parts = base.split(" (")
-            base_short = parts[0]
-        else:
-            base_short = base
-        # Для сопоставления с приоритетом ищем первое совпадение
-        try:
-            idx = priority.index(base_short)
-            return idx
-        except ValueError:
-            # нет в приоритете — ставим большой индекс (после всех)
-            return len(priority) + 1000
+    for cabinet in cabinets:
+        schedules: dict = cabinet.get("fileSchedules", {})
+        token = cabinet.get("token", "")
+        if not token or not schedules:
+            continue
 
-    return sorted([p for p in files], key=key_for_path)
+        for base_name, sched in schedules.items():
+            if not sched.get("enabled"):
+                continue
+
+            hour   = sched.get("hour",   sched.get("time", "08:00").split(":")[0] if "time" in sched else 8)
+            minute = sched.get("minute", sched.get("time", "08:00").split(":")[1] if "time" in sched else 0)
+            hour   = int(hour)
+            minute = int(minute)
+
+            # Найти файл для этой базы в txt_files
+            matching = [
+                p for p in txt_files
+                if os.path.basename(p).startswith(base_name + " (")
+                   or os.path.basename(p) == f"{base_name}.txt"
+            ]
+            if not matching:
+                logger.info("Файл для базы «%s» не найден, пропускаем планировщик", base_name)
+                continue
+
+            file_path = matching[0]
+
+            async def scheduled_upload(cab=cabinet, path=file_path, h=hour, m=minute, bname=base_name):
+                delay = seconds_until_window(h, m)
+                logger.info(
+                    "⏰ Кабинет «%s» файл «%s» — выгрузка через %.0f мин (%02d:%02d UTC)",
+                    cab.get("name"), bname, delay / 60, h, m
+                )
+                await asyncio.sleep(delay)
+                try:
+                    await upload_file_to_cabinets(path, [cab])
+                except Exception as e:
+                    logger.exception("Ошибка плановой выгрузки: %s", e)
+                    send_error_sync(f"Ошибка плановой выгрузки «{bname}»: {e}")
+
+            tasks.append(scheduled_upload())
+
+    if tasks:
+        await asyncio.gather(*tasks)
 
 
-async def process_previous_day_file():
-    """
-    Проверяет наличие файла leads_sub6 за вчерашний день.
-    Возвращает путь, если файл найден (отправка и VK загрузка происходят позже).
-    """
+# ══════════════════════════════════════════════════════════════════════════════
+# === ВСПОМОГАТЕЛЬНЫЕ =========================================================
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def process_previous_day_file() -> Optional[str]:
     yesterday = datetime.today() - timedelta(days=1)
     file_path = f"/opt/leads_postback/data/leads_sub6_{yesterday.strftime('%d.%m.%Y')}.txt"
     if not os.path.exists(file_path):
-        logging.info("Файл leads_sub6 за вчера не найден: %s", file_path)
+        logger.info("leads_sub6 за вчера не найден: %s", file_path)
         return None
-    logging.info("Найден leads_sub6 файл за вчера: %s", file_path)
+    logger.info("Найден leads_sub6: %s", file_path)
     return file_path
 
 
-
-def download_new_subs_from_s3(to_folder="/opt/bot/new_subs"):
-    """
-    Скачивает файл new_subs_DD_MM_YYYY.txt из корня дополнительного S3 бакета.
-    Имя файла формируется для вчерашней даты.
-
-    Требуется установить окружение NEW_S3_BUCKET. Если не задано — ничего не делаем.
-    Можно задать отдельные креды и endpoint через NEW_S3_ENDPOINT, NEW_S3_ACCESS_KEY, NEW_S3_SECRET_KEY.
-    """
-    if not NEW_S3_BUCKET:
-        logging.info("NEW_S3_BUCKET не задан, пропускаем скачивание new_subs.")
-        return None
-
-    yesterday = datetime.today() - timedelta(days=1)
-    filename = f"new_subs_{yesterday.strftime('%d_%m_%Y')}.txt"
-    os.makedirs(to_folder, exist_ok=True)
-    local_path = os.path.join(to_folder, filename)
-
-    # Подготовка клиента: если заданы отдельные креды/endpoint — создаём новый клиент
-    try:
-        if NEW_S3_ACCESS_KEY or NEW_S3_SECRET_KEY or NEW_S3_ENDPOINT:
-            client = boto3.client(
-                "s3",
-                endpoint_url=NEW_S3_ENDPOINT if NEW_S3_ENDPOINT else (S3_ENDPOINT if S3_ENDPOINT else None),
-                aws_access_key_id=NEW_S3_ACCESS_KEY if NEW_S3_ACCESS_KEY else S3_ACCESS_KEY,
-                aws_secret_access_key=NEW_S3_SECRET_KEY if NEW_S3_SECRET_KEY else S3_SECRET_KEY
-            )
-        else:
-            client = s3
-
-        client.download_file(NEW_S3_BUCKET, filename, local_path)
-        logging.info("Скачан файл new_subs из бакета %s: %s", NEW_S3_BUCKET, filename)
-        return local_path
-    except Exception as e:
-        logging.exception("Ошибка при скачивании new_subs из S3: %s", e)
-        send_error_sync(f"Ошибка при скачивании new_subs из S3: {e}")
-        return None
-
-
-
-def cleanup_files(files):
-    """Удаляет файлы из переданного списка, логируя ошибки, работает безопасно."""
+def cleanup_files(files: List[str]):
     for f in files:
         try:
             if os.path.exists(f):
                 os.remove(f)
-                logging.info("Удалён файл: %s", f)
+                logger.info("Удалён: %s", f)
         except Exception:
-            logging.exception("Ошибка при удалении файла: %s", f)
+            logger.exception("Ошибка удаления %s", f)
 
 
 def cleanup_previous_day_txt_files():
-    """
-    Удаляет TXT файлы за предыдущий день из /opt/bot/txt.
-    Определяет вчерашний номер дня и удаляет файлы с этим номером.
-    """
     txt_dir = "/opt/bot/txt"
     if not os.path.exists(txt_dir):
         return
-    
-    yesterday = datetime.today() - timedelta(days=1)
-    yesterday_day_number = get_day_number(yesterday)
-    pattern = f"({yesterday_day_number}).txt"
-    
+    yesterday_num = get_day_number(datetime.today() - timedelta(days=1))
+    pattern = f"({yesterday_num}).txt"
     for filename in os.listdir(txt_dir):
         if filename.endswith(pattern):
             filepath = os.path.join(txt_dir, filename)
             try:
                 os.remove(filepath)
-                logging.info("Удалён вчерашний TXT файл: %s", filename)
+                logger.info("Удалён вчерашний TXT: %s", filename)
             except Exception:
-                logging.exception("Ошибка при удалении файла: %s", filepath)
+                logger.exception("Ошибка удаления %s", filepath)
 
 
-# === Главный процесс ===
+# ══════════════════════════════════════════════════════════════════════════════
+# === ЗАДАЧА КАНАЛА 1 =========================================================
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def task_channel1() -> List[str]:
+    """
+    Ждёт окна 07:03–07:06 UTC+4 (03:03–03:06 UTC),
+    затем скачивает CSV из канала 1, обрабатывает, загружает в S3.
+    Возвращает список txt-файлов.
+    """
+    # Рандомная задержка внутри окна
+    start_h, start_m = CHANNEL1_WINDOW_START
+    end_h,   end_m   = CHANNEL1_WINDOW_END
+    delay = seconds_until_window(start_h, start_m)
+    jitter = random.uniform(0, (end_m - start_m) * 60)  # случайно внутри окна
+    wait = delay + jitter
+    logger.info("Канал 1: ждём %.0f мин до скачивания", wait / 60)
+    await asyncio.sleep(wait)
+
+    if not CHANNEL_NAME:
+        logger.warning("CHANNEL_NAME не задан, пропускаем канал 1")
+        return []
+
+    csv_files = await download_csv_from_channel(
+        CHANNEL_NAME, "/opt/bot/csv", limit=7, session_name="session_ch1"
+    )
+    if not csv_files:
+        await send_error_async("CSV файлы не найдены в канале 1")
+        return []
+
+    txt_files = process_csv_files_ch1(csv_files)
+    cleanup_files(csv_files)
+
+    for f in txt_files:
+        try:
+            upload_to_s3(f)
+        except Exception as e:
+            send_error_sync(f"S3 ошибка {f}: {e}")
+
+    return txt_files
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# === ЗАДАЧА КАНАЛА 2 =========================================================
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def task_channel2() -> List[str]:
+    """
+    Ждёт окна 09:02–09:06 UTC+4 (05:02–05:06 UTC),
+    затем скачивает последние 2 CSV из канала 2, обрабатывает, загружает в S3.
+    """
+    start_h, start_m = CHANNEL2_WINDOW_START
+    end_h,   end_m   = CHANNEL2_WINDOW_END
+    delay  = seconds_until_window(start_h, start_m)
+    jitter = random.uniform(0, (end_m - start_m) * 60)
+    wait   = delay + jitter
+    logger.info("Канал 2: ждём %.0f мин до скачивания", wait / 60)
+    await asyncio.sleep(wait)
+
+    if not CHANNEL_NAME_2:
+        logger.info("CHANNEL_NAME_2 не задан, пропускаем канал 2")
+        return []
+
+    csv_files = await download_csv_from_channel(
+        CHANNEL_NAME_2, "/opt/bot/csv2", limit=7,
+        only_last_n=2, session_name="session_ch2"
+    )
+    if not csv_files:
+        await send_error_async("CSV файлы не найдены в канале 2")
+        return []
+
+    txt_files = process_csv_files_ch2(csv_files)
+    cleanup_files(csv_files)
+
+    for f in txt_files:
+        try:
+            upload_to_s3(f)
+        except Exception as e:
+            send_error_sync(f"S3 ошибка {f}: {e}")
+
+    return txt_files
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# === ГЛАВНЫЙ ПРОЦЕСС =========================================================
+# ══════════════════════════════════════════════════════════════════════════════
+
+def refresh_portal_bases_sync():
+    """
+    Обновляет list_base.json портала напрямую — сканирует S3 через boto3
+    и перезаписывает файл. Портал читает его при следующем запросе.
+    Никаких HTTP-запросов и токенов не нужно — оба процесса на одном сервере.
+    """
+    if not os.path.dirname(LIST_BASE_JSON):
+        return
+
+    logger.info("🔄 Обновляем list_base.json портала...")
+    try:
+        import re as _re
+
+        # Базовая дата и номер — должны совпадать с server.js
+        BASE_DATE_PORTAL   = datetime(2026, 4, 13)
+        BASE_NUMBER_PORTAL = 326
+
+        def _num_to_date(num):
+            return BASE_DATE_PORTAL + timedelta(days=num - BASE_NUMBER_PORTAL)
+
+        def _parse_name(name):
+            m = _re.match(r"^(.+?)\s*\((\d+)\)\.txt$", name)
+            if m:
+                return m.group(1).strip(), int(m.group(2))
+            return None, None
+
+        files_data = []
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix="txt/"):
+            for obj in page.get("Contents", []):
+                key      = obj["Key"]
+                filename = key.replace("txt/", "", 1)
+                base_name, number = _parse_name(filename)
+                if not base_name:
+                    continue
+                d = _num_to_date(number)
+                files_data.append({
+                    "key":      key,
+                    "fileName": filename,
+                    "baseName": base_name,
+                    "number":   number,
+                    "size":     obj["Size"],
+                    "date":     d.isoformat() + "Z",
+                })
+
+        list_base_data = {
+            "files":       files_data,
+            "lastUpdated": datetime.utcnow().isoformat() + "Z",
+        }
+
+        os.makedirs(os.path.dirname(LIST_BASE_JSON), exist_ok=True)
+        tmp = LIST_BASE_JSON + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(list_base_data, f, ensure_ascii=False)
+        os.replace(tmp, LIST_BASE_JSON)
+
+        logger.info("✅ list_base.json обновлён: %d файлов", len(files_data))
+    except Exception as e:
+        logger.exception("Не удалось обновить list_base.json: %s", e)
+
+
+async def refresh_portal_bases():
+    """Асинхронная обёртка — запускает синхронную функцию в executor."""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, refresh_portal_bases_sync)
+
+
+async def run_test():
+    """
+    Тест-режим: скачивает один CSV-файл из канала 1, конвертирует в test.txt,
+    загружает в первый доступный кабинет из cabinets.json.
+    Отправка в TG и S3 — пропускается.
+    """
+    logger.info("=== 🧪 ТЕСТ-РЕЖИМ ===")
+
+    # 1) Прокси
+    select_proxy()
+
+    # 2) Скачиваем 1 файл из канала 1
+    if not CHANNEL_NAME:
+        logger.error("CHANNEL_NAME не задан")
+        return
+
+    logger.info("📥 Скачиваем 1 CSV из %s...", CHANNEL_NAME)
+    os.makedirs("/opt/bot/csv_test", exist_ok=True)
+
+    proxy_kwargs = _telethon_proxy() or {}
+    client = TelegramClient("session_test", API_ID, API_HASH, **proxy_kwargs)
+    await client.start(PHONE)
+
+    test_csv = None
+    try:
+        async for msg in client.iter_messages(CHANNEL_NAME, limit=10):
+            if msg.file and msg.file.name and msg.file.name.endswith(".csv"):
+                path = "/opt/bot/csv_test/" + msg.file.name
+                await msg.download_media(file=path)
+                test_csv = path
+                logger.info("✅ Скачан: %s", msg.file.name)
+                break
+    finally:
+        await client.disconnect()
+
+    if not test_csv:
+        logger.error("CSV не найден в канале")
+        return
+
+    # 3) Конвертируем в test.txt (просто берём номера телефонов)
+    test_txt = "/opt/bot/txt/test.txt"
+    os.makedirs("/opt/bot/txt", exist_ok=True)
+    try:
+        import pandas as pd
+        df = pd.read_csv(test_csv)
+        if "phone" in df.columns:
+            phones = sorted({
+                str(p).replace("+", "").strip()
+                for p in df["phone"].dropna()
+                if str(p).replace("+", "").strip()
+            })
+            with open(test_txt, "w", encoding="utf-8") as f:
+                f.write("\n".join(phones[:100]))  # первые 100 для теста
+            logger.info("✅ test.txt создан: %d номеров (из %d)", len(phones[:100]), len(phones))
+        else:
+            logger.error("Нет столбца phone в %s", test_csv)
+            return
+    except Exception as e:
+        logger.exception("Ошибка конвертации: %s", e)
+        return
+    finally:
+        try: os.remove(test_csv)
+        except Exception: pass
+
+    # 4) Загружаем в первый кабинет
+    cabs = load_cabinets()
+    if not cabs:
+        logger.error("Нет кабинетов в cabinets.json")
+        return
+
+    cab = cabs[0]
+    logger.info("📤 Загружаем test.txt в кабинет «%s»...", cab.get("name"))
+    try:
+        list_id = upload_user_list_vk(test_txt, "test", cab["token"], list_type="phones")
+        create_segment_vk(list_id, "LAL test", cab["token"])
+        logger.info("✅ Успешно загружен в «%s» (list_id=%s)", cab.get("name"), list_id)
+    except Exception as e:
+        logger.exception("Ошибка VK upload: %s", e)
+
+    # 5) Cleanup
+    try: os.remove(test_txt)
+    except Exception: pass
+
+    logger.info("=== 🧪 ТЕСТ ЗАВЕРШЁН ===")
+
+
 async def main():
-    logging.info("=== 🚀 Запуск bot_master ===")
+    logger.info("=== 🚀 Запуск bot_master v%s ===", VersionBotMaster)
 
-    # 0) Пробуем скачать new_subs из дополнительного бакета (если задан)
+    # 0a) Выбираем рабочий прокси при старте
+    select_proxy()
+
+    # 0b) new_subs из дополнительного S3
     new_subs_path = download_new_subs_from_s3()
 
-    # 1) Сначала обрабатываем файл leads_sub6 вчерашнего дня (Только TG, путь вернём для VK)
+    # 1) leads_sub6 за вчера
     leads_sub6_path = await process_previous_day_file()
 
-    csv_files = []
-    txt_files = []
+    # 2) Параллельно скачиваем из обоих каналов
+    # Канал 1 и канал 2 — независимые временны́е окна
+    logger.info("Запускаем задачи скачивания для обоих каналов параллельно")
+    ch1_task = asyncio.create_task(task_channel1())
+    ch2_task = asyncio.create_task(task_channel2())
 
-    if DOWNLOAD_FROM_TG:
-        # 2) Скачиваем CSV из Telegram в /opt/bot/csv
-        csv_files = await download_latest_csv("/opt/bot/csv")
-        if not csv_files:
-            msg = "CSV файлы не найдены в Telegram."
-            logging.warning(msg)
-            await send_error_async(msg)
-            return
+    txt_files_ch1, txt_files_ch2 = await asyncio.gather(ch1_task, ch2_task)
 
-        # 3) Обрабатываем CSV -> TXT
-        txt_files = process_csv_files(csv_files)
-        if not txt_files:
-            msg = "Не получили TXT файлы после обработки CSV."
-            logging.warning(msg)
-            await send_error_async(msg)
-            cleanup_files(csv_files)
-            return
+    # 3) Объединяем все TXT
+    all_txt_files = list(txt_files_ch1) + list(txt_files_ch2)
 
-        # 4) Загрузка TXT в S3 (CSV не трогаем)
-        for f in txt_files:
-            try:
-                upload_to_s3(f)
-            except Exception as e:
-                logging.exception("Ошибка загрузки в S3")
-                send_error_sync(f"Ошибка загрузки в S3 {f}: {e}")
-    else:
-        # Берём существующие TXT файлы из /opt/bot/txt/
-        logging.info("⏭️ Скачивание из Telegram пропущено (DOWNLOAD_FROM_TG=False)")
-        txt_dir = "/opt/bot/txt"
-        if os.path.exists(txt_dir):
-            txt_files = [
-                os.path.join(txt_dir, f) 
-                for f in os.listdir(txt_dir) 
-                if f.endswith(".txt")
-            ]
-            logging.info(f"Найдено {len(txt_files)} TXT файлов в {txt_dir}")
-        
-        if not txt_files:
-            msg = "TXT файлы не найдены в /opt/bot/txt/"
-            logging.warning(msg)
-            await send_error_async(msg)
-            return
+    # 4) Обновляем список баз на портале (асинхронно, не блокирует)
+    if all_txt_files:
+        asyncio.create_task(refresh_portal_bases())
 
-    # 5) Сортируем TXT файлы по требуемому порядку
-    txt_files_ordered = order_txt_files(txt_files)
+    # 5) Сортируем по приоритету
+    txt_files_ordered = order_txt_files(all_txt_files)
 
-    # 5.1) Запускаем max_checker параллельно (формирование файлов для проверки номеров)
+    # 6) max_checker (опционально)
     checker_task = None
     if PROMOUSER_UPLOAD and MAX_CHECKER_AVAILABLE:
         try:
             checker_task = start_checker_task()
-            logging.info("🔍 Запущен max_checker в фоновом режиме")
+            logger.info("🔍 max_checker запущен")
         except Exception as e:
-            logging.exception("Ошибка запуска max_checker")
-            await send_error_async(f"Ошибка запуска max_checker: {e}")
-    elif not PROMOUSER_UPLOAD:
-        logging.info("⏭️ max_checker пропущен (PROMOUSER_UPLOAD=False)")
+            logger.exception("Ошибка max_checker")
+            await send_error_async(f"Ошибка max_checker: {e}")
 
-    # 6) Подготавливаем общий список файлов, которые надо:
-    #    - СНАЧАЛА отправить в TG (все)
-    #    - ПОТОМ загрузить в VK (все, тем же порядком)
+    # 6) Pipeline файлов: new_subs, leads_sub6, txt
     files_pipeline = []
-
-    # Первым идёт new_subs (если найден)
     if new_subs_path and os.path.exists(new_subs_path):
         files_pipeline.append(new_subs_path)
-
     if leads_sub6_path and os.path.exists(leads_sub6_path):
         files_pipeline.append(leads_sub6_path)
-
     files_pipeline.extend(txt_files_ordered)
 
-    # 7) ЭТАП 1 — сначала отправляем ВСЕ файлы в Telegram (без звука)
+    # 7) Отправляем все файлы в Telegram
     if SEND_FILES_TO_TELEGRAM:
         for path in files_pipeline:
             try:
                 await send_file_to_telegram(path)
             except Exception as e:
-                logging.exception("Ошибка отправки в Telegram")
-                await send_error_async(f"Ошибка при отправке файла в Telegram {path}: {e}")
-    else:
-        logging.info("⏭️ Отправка файлов в Telegram отключена (SEND_FILES_TO_TELEGRAM=False)")
+                logger.exception("Ошибка отправки в TG")
+                await send_error_async(f"TG отправка {path}: {e}")
 
-    # 8) ЭТАП 2 — затем загружаем ВСЕ файлы в VK ADS (каждый файл — во все кабинеты)
-    #    Для leads_sub6 нужен особый list_type/name, для остальных — по умолчанию.
-    first_success = None
+    # 8) Загружаем в VK по расписанию из портала
     if VK_UPLOAD:
-        for path in files_pipeline:
-            fname = os.path.basename(path)
-            try:
-                if fname.startswith("leads_sub6_"):
-                    # Нейминг, как был раньше
-                    date_part = fname.replace("leads_sub6_", "").replace(".txt", "")
-                    custom_list_name = f"ls6_{date_part}"
-                    res = await upload_to_all_vk_and_get_one_sharing_key(
-                        path, VK_ACCESS_TOKENS,
-                        list_name=custom_list_name,
-                        list_type="vk",
-                        segment_prefix="LAL "
-                    )
-                elif fname.startswith("new_subs_"):
-                    # Для new_subs используем list_type="vk" по требованию
-                    res = await upload_to_all_vk_and_get_one_sharing_key(
-                        path, VK_ACCESS_TOKENS,
-                        list_name=None,
-                        list_type="vk",
-                        segment_prefix="LAL "
-                    )
-                else:
-                    # Обычные TXT (типы телефонов)
-                    res = await upload_to_all_vk_and_get_one_sharing_key(
-                        path, VK_ACCESS_TOKENS,
-                        list_name=None,
-                        list_type="phones",
-                        segment_prefix="LAL "
-                    )
-                if res and first_success is None:
-                    first_success = res
-            except Exception as e:
-                logging.exception("Ошибка VK загрузки")
-                send_error_sync(f"Ошибка VK загрузки {fname}: {e}")
-    else:
-        logging.info("⏭️ Загрузка в VK пропущена (VK_UPLOAD=False)")
+        cabinets = load_cabinets()
+        if not cabinets:
+            logger.warning("Кабинеты не загружены из портала, VK выгрузка пропущена")
+        else:
+            logger.info("Загружено %d кабинетов из портала", len(cabinets))
+            # Планировщик — каждый файл/кабинет загружается в своё время
+            # Параллельный запуск — asyncio.gather внутри
+            await vk_upload_scheduler(cabinets, files_pipeline)
 
-    # Удаляем локальную копию new_subs после отправки в TG и загрузки в VK
+    # 9) Удаляем new_subs
     try:
         if new_subs_path and os.path.exists(new_subs_path):
             os.remove(new_subs_path)
-            logging.info("Удалён локальный new_subs файл: %s", new_subs_path)
     except Exception:
-        logging.exception("Ошибка при удалении new_subs файла")
+        logger.exception("Ошибка удаления new_subs")
 
-    # 9) Ожидаем завершения max_checker ПЕРЕД удалением файлов
-    #    ВАЖНО: ждём реально, иначе systemd oneshot завершит процесс
+    # 10) Ждём max_checker
     if checker_task is not None:
-        logging.info("⏳ Ожидаем завершения max_checker (60+ минут)...")
+        logger.info("⏳ Ожидаем max_checker...")
         try:
             await checker_task
-            logging.info("✅ max_checker завершён")
+            logger.info("✅ max_checker завершён")
         except Exception as e:
-            logging.exception(f"Ошибка в max_checker: {e}")
-            await send_error_async(f"Ошибка в max_checker: {e}")
+            logger.exception("Ошибка max_checker")
+            await send_error_async(f"max_checker: {e}")
 
-    # 10) Очистка временных файлов — удаляем CSV сегодня (если скачивали), TXT за ВЧЕРА
+    # 11) Очистка
     try:
-        if DOWNLOAD_FROM_TG and csv_files:
-            cleanup_files(csv_files)  # CSV удаляем только если скачивали из TG
-        # TXT за вчерашний день удаляем
         cleanup_previous_day_txt_files()
     except Exception:
-        logging.exception("Ошибка при финальной очистке файлов")
+        logger.exception("Ошибка очистки файлов")
 
-    logging.info("✅ Все задачи завершены.")
+    logger.info("✅ bot_master завершён")
 
+    # Завершаем SSH-туннель если использовался
+    _stop_ssh_tunnel()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if TEST_MODE:
+        asyncio.run(run_test())
+    else:
+        asyncio.run(main())
