@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bot_master.py v4.6
+bot_master.py v4.7
 ──────────────────
 Изменения:
   • Два TG-канала с независимыми окнами скачивания (UTC+4):
@@ -1403,38 +1403,43 @@ async def run_test():
         elif DO_CHANNEL2:
             print(f"🔍 Канал 2: {CHANNEL_NAME_2}")
             print("-"*40)
-            # Пробуем разные варианты ID: как есть, с -100, без минуса
-            ch2_variants = [CHANNEL_NAME_2]
-            raw = CHANNEL_NAME_2.lstrip('-')
-            if not CHANNEL_NAME_2.startswith('-100') and raw.isdigit():
-                ch2_variants.append(f"-100{raw}")
-            if CHANNEL_NAME_2.startswith('-') and not CHANNEL_NAME_2.startswith('-100'):
-                # уже добавили выше
-                pass
+            # Ищем сущность по ID напрямую через диалоги (надёжнее чем по строке)
+            ch2_entity  = None
+            ch2_used_id = None
+            raw_num = int(CHANNEL_NAME_2.lstrip('-')) if CHANNEL_NAME_2.lstrip('-').isdigit() else None
+
+            # Сначала пробуем найти в кэше диалогов
+            if raw_num:
+                async for dlg in client.iter_dialogs():
+                    if abs(dlg.entity.id) == raw_num:
+                        ch2_entity  = dlg.entity
+                        ch2_used_id = str(dlg.entity.id)
+                        print(f"  ✅ Найден в диалогах: «{dlg.name}» (id={ch2_used_id})")
+                        if hasattr(dlg.entity, 'username') and dlg.entity.username:
+                            print(f"     Username: @{dlg.entity.username}")
+                            print(f"     💡 Обновите .env: CHANNEL_NAME_2=@{dlg.entity.username}")
+                        else:
+                            print(f"     💡 Обновите .env: CHANNEL_NAME_2={ch2_used_id}")
+                        break
 
             ch2_files = []
-            ch2_used_id = None
-            for variant in ch2_variants:
+            if ch2_entity is None:
+                print(f"  ❌ Не найден в диалогах. Telethon не может обратиться к чату по числовому ID")
+                print(f"     если он не был загружен в сессию. Попробуйте:")
+                print(f"     1. Отправить любое сообщение в этот чат с вашего аккаунта")
+                print(f"     2. Или попросить ссылку-приглашение (t.me/+...)")
+                print(f"     3. Или указать @username если он есть")
+            else:
                 try:
-                    async for msg in client.iter_messages(variant, limit=10):
+                    async for msg in client.iter_messages(ch2_entity, limit=10):
                         if msg.file and msg.file.name and msg.file.name.endswith(".csv"):
                             ch2_files.append(msg)
                             if len(ch2_files) >= 2:
                                 break
-                    ch2_used_id = variant
-                    break  # успешно
                 except Exception as e:
-                    print(f"  ⚠️  Вариант {variant}: {e}")
-                    continue
+                    print(f"  ❌ Ошибка чтения сообщений: {e}")
 
-            if ch2_used_id and ch2_used_id != CHANNEL_NAME_2:
-                print(f"  💡 Сработал ID: {ch2_used_id}")
-                print(f"     Обновите .env: CHANNEL_NAME_2={ch2_used_id}")
-
-            if not ch2_files:
-                print("  ❌ CSV файлов не найдено ни по одному варианту ID")
-                print("  💡 Убедитесь что аккаунт вступил в этот канал")
-            else:
+            if ch2_files:
                 print(f"  Последние файлы ({len(ch2_files)}):")
                 for f in ch2_files:
                     kb = (f.file.size or 0) // 1024
