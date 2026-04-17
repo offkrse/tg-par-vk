@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bot_master.py v4.3
+bot_master.py v4.4
 ──────────────────
 Изменения:
   • Два TG-канала с независимыми окнами скачивания (UTC+4):
@@ -387,11 +387,11 @@ ERROR_BOT_TOKEN = os.getenv("ERROR_BOT_TOKEN")
 ERROR_CHAT_ID   = os.getenv("ERROR_CHAT_ID")
 
 # Путь к cabinets.json портала
-CABINETS_JSON = os.getenv("CABINETS_JSON", "/opt/portal/backend/data/cabinets.json")
+CABINETS_JSON = os.getenv("CABINETS_JSON", "/opt/base-portal/backend/data/cabinets.json")
 
 # Путь к list_base.json портала — прямая перезапись файла (без HTTP и токенов)
 # Портал и bot_master работают на одном сервере, файл читается при каждом запросе
-LIST_BASE_JSON = os.getenv("LIST_BASE_JSON", "/opt/portal/backend/data/list_base.json")
+LIST_BASE_JSON = os.getenv("LIST_BASE_JSON", "/opt/base-portal/backend/data/list_base.json")
 
 # Нумерация дней
 BASE_DATE   = datetime(2025, 7, 14)
@@ -1284,26 +1284,58 @@ async def refresh_portal_bases():
 
 async def run_test():
     """
-    Тест-режим: скачивает один CSV-файл из канала 1, конвертирует в test.txt,
-    загружает в первый доступный кабинет из cabinets.json.
-    Отправка в TG и S3 — пропускается.
+    Тест-режим:
+      1) Показывает первые 15 диалогов (каналы/чаты) — для поиска ID второго канала
+      2) Скачивает один CSV из канала 1, конвертирует в test.txt
+      3) Загружает в первый кабинет из cabinets.json
     """
     logger.info("=== 🧪 ТЕСТ-РЕЖИМ ===")
 
     # 1) Прокси
     select_proxy()
 
-    # 2) Скачиваем 1 файл из канала 1
+    proxy_kwargs = _telethon_proxy() or {}
+    client = TelegramClient("session_master", API_ID, API_HASH, **proxy_kwargs)
+    await client.start(PHONE)
+
+    # ── Список первых 15 диалогов (каналы и чаты) ──────────────────────────
+    print("\n" + "="*60)
+    print("📋 ПЕРВЫЕ 15 КАНАЛОВ/ЧАТОВ (для поиска ID второго канала)")
+    print("="*60)
+    print(f"{'#':<4} {'ID':<15} {'Тип':<12} {'Название'}")
+    print("-"*60)
+    try:
+        count = 0
+        async for dialog in client.iter_dialogs():
+            if count >= 15:
+                break
+            entity = dialog.entity
+            entity_type = type(entity).__name__  # Channel, Chat, User
+            # Для каналов/супергрупп ID отрицательный в формате -100XXXXXXXXXX
+            raw_id = entity.id
+            # Формат для использования в .env (username или -100... ID)
+            if hasattr(entity, 'username') and entity.username:
+                usable_id = f"@{entity.username}"
+            else:
+                usable_id = str(raw_id)
+            print(f"{count+1:<4} {usable_id:<15} {entity_type:<12} {dialog.name}")
+            count += 1
+            await asyncio.sleep(0.1)
+    except Exception as e:
+        logger.warning("Ошибка получения диалогов: %s", e)
+    print("="*60)
+    print("💡 Скопируйте ID или @username нужного канала")
+    print("   и вставьте в /opt/bot/.env как CHANNEL_NAME_2=...")
+    print("="*60 + "\n")
+
+    # ── Скачиваем 1 файл из канала 1 ───────────────────────────────────────
     if not CHANNEL_NAME:
-        logger.error("CHANNEL_NAME не задан")
+        logger.error("CHANNEL_NAME не задан в .env")
+        await client.disconnect()
         return
 
     logger.info("📥 Скачиваем 1 CSV из %s...", CHANNEL_NAME)
     os.makedirs("/opt/bot/csv_test", exist_ok=True)
-
-    proxy_kwargs = _telethon_proxy() or {}
-    client = TelegramClient("session_master", API_ID, API_HASH, **proxy_kwargs)
-    await client.start(PHONE)
 
     test_csv = None
     try:
