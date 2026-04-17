@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bot_master.py v4.1
+bot_master.py v4.2
 ──────────────────
 Изменения:
   • Два TG-канала с независимыми окнами скачивания (UTC+4):
@@ -889,6 +889,7 @@ def download_new_subs_from_s3(to_folder="/opt/bot/new_subs") -> Optional[str]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def send_file_to_telegram(file_path: str, chat_id: str = CHAT_ID):
+    global _active_proxy  # объявляем в начале функции
     if not BOT_TOKEN or not chat_id:
         return
 
@@ -923,7 +924,6 @@ async def send_file_to_telegram(file_path: str, chat_id: str = CHAT_ID):
         except Exception as e:
             logger.warning("Ошибка отправки в TG (попытка %d): %s", attempt, e)
             if attempt < 3:
-                global _active_proxy
                 _active_proxy = None
                 await ensure_proxy()
                 connector = _aiohttp_connector()
