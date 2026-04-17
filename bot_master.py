@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bot_master.py v4.4
+bot_master.py v4.5
 ──────────────────
 Изменения:
   • Два TG-канала с независимыми окнами скачивания (UTC+4):
@@ -1285,117 +1285,152 @@ async def refresh_portal_bases():
 async def run_test():
     """
     Тест-режим:
-      1) Показывает первые 15 диалогов (каналы/чаты) — для поиска ID второго канала
-      2) Скачивает один CSV из канала 1, конвертирует в test.txt
-      3) Загружает в первый кабинет из cabinets.json
+      1) Показывает первые 15 диалогов — для поиска ID каналов
+      2) Проверяет канал 1: находит наименьший CSV и берёт 10 строк
+      3) Проверяет канал 2 (если задан): показывает последние 2 файла
+      4) Загружает test.txt в первый кабинет VK
     """
     logger.info("=== 🧪 ТЕСТ-РЕЖИМ ===")
-
-    # 1) Прокси
     select_proxy()
+
+    from telethon.tl.types import Channel, Chat
 
     proxy_kwargs = _telethon_proxy() or {}
     client = TelegramClient("session_master", API_ID, API_HASH, **proxy_kwargs)
     await client.start(PHONE)
 
-    # ── Список первых 15 диалогов (каналы и чаты) ──────────────────────────
-    print("\n" + "="*60)
-    print("📋 ПЕРВЫЕ 15 КАНАЛОВ/ЧАТОВ (для поиска ID второго канала)")
-    print("="*60)
-    print(f"{'#':<4} {'ID':<15} {'Тип':<12} {'Название'}")
-    print("-"*60)
     try:
-        count = 0
-        async for dialog in client.iter_dialogs():
-            if count >= 15:
-                break
-            entity = dialog.entity
-            entity_type = type(entity).__name__  # Channel, Chat, User
-            # Для каналов/супергрупп ID отрицательный в формате -100XXXXXXXXXX
-            raw_id = entity.id
-            # Формат для использования в .env (username или -100... ID)
-            if hasattr(entity, 'username') and entity.username:
-                usable_id = f"@{entity.username}"
-            else:
-                usable_id = str(raw_id)
-            print(f"{count+1:<4} {usable_id:<15} {entity_type:<12} {dialog.name}")
-            count += 1
-            await asyncio.sleep(0.1)
-    except Exception as e:
-        logger.warning("Ошибка получения диалогов: %s", e)
-    print("="*60)
-    print("💡 Скопируйте ID или @username нужного канала")
-    print("   и вставьте в /opt/bot/.env как CHANNEL_NAME_2=...")
-    print("="*60 + "\n")
+        # ── 1. Список диалогов ──────────────────────────────────────────────
+        print("\n" + "="*65)
+        print("📋 ПЕРВЫЕ 15 КАНАЛОВ/ЧАТОВ")
+        print("="*65)
+        print(f"{'#':<4} {'ID для .env':<25} {'Тип':<14} {'Название'}")
+        print("-"*65)
+        try:
+            count = 0
+            async for dialog in client.iter_dialogs():
+                if count >= 15:
+                    break
+                entity = dialog.entity
+                raw_id = entity.id
+                if isinstance(entity, Channel):
+                    env_id      = f"-100{raw_id}"
+                    entity_type = "Канал" if not entity.megagroup else "Супергруппа"
+                elif isinstance(entity, Chat):
+                    env_id      = f"-{raw_id}"
+                    entity_type = "Чат"
+                else:
+                    env_id      = str(raw_id)
+                    entity_type = "Личка"
+                if hasattr(entity, 'username') and entity.username:
+                    env_id = f"@{entity.username}"
+                print(f"{count+1:<4} {env_id:<25} {entity_type:<14} {dialog.name}")
+                count += 1
+                await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.warning("Ошибка списка диалогов: %s", e)
+        print("="*65)
+        print(f"CHANNEL_NAME   = {CHANNEL_NAME or '❌ не задан'}")
+        print(f"CHANNEL_NAME_2 = {CHANNEL_NAME_2 or '⚠️  не задан (опционально)'}")
+        print("="*65 + "\n")
 
-    # ── Скачиваем 1 файл из канала 1 ───────────────────────────────────────
-    if not CHANNEL_NAME:
-        logger.error("CHANNEL_NAME не задан в .env")
-        await client.disconnect()
-        return
-
-    logger.info("📥 Скачиваем 1 CSV из %s...", CHANNEL_NAME)
-    os.makedirs("/opt/bot/csv_test", exist_ok=True)
-
-    test_csv = None
-    try:
-        async for msg in client.iter_messages(CHANNEL_NAME, limit=10):
-            if msg.file and msg.file.name and msg.file.name.endswith(".csv"):
-                path = "/opt/bot/csv_test/" + msg.file.name
-                await msg.download_media(file=path)
-                test_csv = path
-                logger.info("✅ Скачан: %s", msg.file.name)
-                break
-    finally:
-        await client.disconnect()
-
-    if not test_csv:
-        logger.error("CSV не найден в канале")
-        return
-
-    # 3) Конвертируем в test.txt (просто берём номера телефонов)
-    test_txt = "/opt/bot/txt/test.txt"
-    os.makedirs("/opt/bot/txt", exist_ok=True)
-    try:
-        import pandas as pd
-        df = pd.read_csv(test_csv)
-        if "phone" in df.columns:
-            phones = sorted({
-                str(p).replace("+", "").strip()
-                for p in df["phone"].dropna()
-                if str(p).replace("+", "").strip()
-            })
-            with open(test_txt, "w", encoding="utf-8") as f:
-                f.write("\n".join(phones[:100]))  # первые 100 для теста
-            logger.info("✅ test.txt создан: %d номеров (из %d)", len(phones[:100]), len(phones))
+        # ── 2. Проверка канала 1 ────────────────────────────────────────────
+        if not CHANNEL_NAME:
+            logger.error("CHANNEL_NAME не задан в .env — пропускаем")
         else:
-            logger.error("Нет столбца phone в %s", test_csv)
-            return
-    except Exception as e:
-        logger.exception("Ошибка конвертации: %s", e)
-        return
-    finally:
-        try: os.remove(test_csv)
-        except Exception: pass
+            print(f"🔍 Канал 1: {CHANNEL_NAME}")
+            print("-"*40)
+            # Ищем самый маленький CSV чтобы скачать быстро
+            candidates = []
+            async for msg in client.iter_messages(CHANNEL_NAME, limit=15):
+                if msg.file and msg.file.name and msg.file.name.endswith(".csv"):
+                    candidates.append((msg.file.size or 0, msg))
+            if not candidates:
+                print("  ❌ CSV файлов не найдено")
+            else:
+                # Берём наименьший
+                candidates.sort(key=lambda x: x[0])
+                smallest_size, smallest_msg = candidates[0]
+                print(f"  Файлов найдено: {len(candidates)}")
+                print(f"  Самый маленький: {smallest_msg.file.name} ({smallest_size // 1024} KB)")
+                os.makedirs("/opt/bot/csv_test", exist_ok=True)
+                path = f"/opt/bot/csv_test/test_ch1_{smallest_msg.file.name}"
+                await smallest_msg.download_media(file=path)
+                print(f"  ✅ Скачан: {smallest_msg.file.name}")
+                # Читаем первые 10 строк
+                try:
+                    df = pd.read_csv(path)
+                    total = len(df)
+                    cols  = list(df.columns)
+                    print(f"  Строк: {total}, колонки: {cols}")
+                    if "phone" in df.columns:
+                        phones_count = df["phone"].dropna().count()
+                        print(f"  Номеров телефонов: {phones_count}")
+                        # Сохраняем 10 строк для VK теста
+                        test_txt = "/opt/bot/txt/test.txt"
+                        os.makedirs("/opt/bot/txt", exist_ok=True)
+                        sample = [
+                            str(p).replace("+", "").strip()
+                            for p in df["phone"].dropna()
+                            if str(p).replace("+", "").strip()
+                        ][:10]
+                        with open(test_txt, "w") as f:
+                            f.write("\n".join(sample))
+                        print(f"  test.txt: {len(sample)} номеров (для VK)")
+                    else:
+                        print(f"  ⚠️  Нет колонки phone, есть: {cols}")
+                        test_txt = None
+                except Exception as e:
+                    print(f"  ❌ Ошибка чтения CSV: {e}")
+                    test_txt = None
+                finally:
+                    try: os.remove(path)
+                    except Exception: pass
+            print()
 
-    # 4) Загружаем в первый кабинет
+        # ── 3. Проверка канала 2 ────────────────────────────────────────────
+        if not CHANNEL_NAME_2:
+            print("⚠️  CHANNEL_NAME_2 не задан — пропускаем проверку канала 2\n")
+        else:
+            print(f"🔍 Канал 2: {CHANNEL_NAME_2}")
+            print("-"*40)
+            ch2_files = []
+            async for msg in client.iter_messages(CHANNEL_NAME_2, limit=10):
+                if msg.file and msg.file.name and msg.file.name.endswith(".csv"):
+                    ch2_files.append(msg)
+                    if len(ch2_files) >= 2:
+                        break
+            if not ch2_files:
+                print("  ❌ CSV файлов не найдено")
+            else:
+                print(f"  Последние файлы ({len(ch2_files)}):")
+                for f in ch2_files:
+                    kb = (f.file.size or 0) // 1024
+                    mapped = get_ch2_output_filename(f.file.name, get_day_number(datetime.today()))
+                    print(f"    • {f.file.name} ({kb} KB) → {mapped or '⚠️  не распознан'}")
+            print()
+
+    finally:
+        await client.disconnect()
+
+    # ── 4. VK загрузка ──────────────────────────────────────────────────────
     cabs = load_cabinets()
     if not cabs:
         logger.error("Нет кабинетов в cabinets.json")
-        return
-
-    cab = cabs[0]
-    logger.info("📤 Загружаем test.txt в кабинет «%s»...", cab.get("name"))
-    try:
-        list_id = upload_user_list_vk(test_txt, "test", cab["token"], list_type="phones")
-        create_segment_vk(list_id, "LAL test", cab["token"])
-        logger.info("✅ Успешно загружен в «%s» (list_id=%s)", cab.get("name"), list_id)
-    except Exception as e:
-        logger.exception("Ошибка VK upload: %s", e)
-
-    # 5) Cleanup
-    try: os.remove(test_txt)
-    except Exception: pass
+    elif not (test_txt if 'test_txt' in dir() else None) or not os.path.exists(test_txt if 'test_txt' in dir() else ''):
+        print("⚠️  test.txt не создан (нет колонки phone?) — VK загрузка пропущена")
+    else:
+        cab = cabs[0]
+        print(f"📤 VK: загружаем test.txt в кабинет «{cab.get('name')}»...")
+        try:
+            list_id = upload_user_list_vk(test_txt, "test", cab["token"], list_type="phones")
+            create_segment_vk(list_id, "LAL test", cab["token"])
+            print(f"  ✅ Загружено в «{cab.get('name')}» (list_id={list_id})")
+        except Exception as e:
+            print(f"  ❌ Ошибка VK: {e}")
+        finally:
+            try: os.remove(test_txt)
+            except Exception: pass
 
     logger.info("=== 🧪 ТЕСТ ЗАВЕРШЁН ===")
 
