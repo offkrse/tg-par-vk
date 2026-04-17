@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bot_master.py v4.7
+bot_master.py v4.8
 ──────────────────
 Изменения:
   • Два TG-канала с независимыми окнами скачивания (UTC+4):
@@ -635,6 +635,22 @@ def order_txt_files(files: List[str]) -> List[str]:
 # === СКАЧИВАНИЕ ИЗ TELEGRAM ==================================================
 # ══════════════════════════════════════════════════════════════════════════════
 
+async def _resolve_channel(client, channel: str):
+    """
+    Возвращает entity для канала/чата.
+    Для числовых ID ищет в диалогах (InputPeerChat не работает по строке).
+    """
+    raw = channel.lstrip('-')
+    if raw.isdigit():
+        target = int(raw)
+        async for dlg in client.iter_dialogs():
+            if abs(dlg.entity.id) == target:
+                return dlg.input_entity
+        # Не нашли в диалогах — пробуем как есть (может сработать для каналов -100...)
+        return channel
+    return channel  # @username или t.me/+ ссылка — передаём напрямую
+
+
 async def download_csv_from_channel(
     channel: str,
     to_folder: str,
@@ -677,8 +693,12 @@ async def download_csv_from_channel(
     seen_names: set = set()
     result_files: List[str] = []
 
+    # Резолвим entity (нужно для InputPeerChat — обычных групп)
+    resolved = await _resolve_channel(client, channel)
+    logger.info("Резолв канала %s → %s", channel, type(resolved).__name__)
+
     try:
-        async for msg in client.iter_messages(channel, limit=limit):
+        async for msg in client.iter_messages(resolved, limit=limit):
             try:
                 if msg.file and msg.file.name and msg.file.name.endswith(".csv"):
                     orig_name = msg.file.name
@@ -1431,7 +1451,15 @@ async def run_test():
                 print(f"     3. Или указать @username если он есть")
             else:
                 try:
-                    async for msg in client.iter_messages(ch2_entity, limit=10):
+                    # Используем input_entity для корректного обращения к чату
+                    import inspect
+                    peer = ch2_entity if not hasattr(ch2_entity, 'id') else ch2_entity
+                    # Получаем input_entity из диалога
+                    async for dlg in client.iter_dialogs():
+                        if abs(dlg.entity.id) == abs(ch2_entity.id):
+                            peer = dlg.input_entity
+                            break
+                    async for msg in client.iter_messages(peer, limit=10):
                         if msg.file and msg.file.name and msg.file.name.endswith(".csv"):
                             ch2_files.append(msg)
                             if len(ch2_files) >= 2:
