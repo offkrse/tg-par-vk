@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bot_master.py v4.2
+bot_master.py v4.3
 ──────────────────
 Изменения:
   • Два TG-канала с независимыми окнами скачивания (UTC+4):
@@ -1152,7 +1152,7 @@ async def task_channel1() -> List[str]:
         return []
 
     csv_files = await download_csv_from_channel(
-        CHANNEL_NAME, "/opt/bot/csv", limit=7, session_name="session_ch1"
+        CHANNEL_NAME, "/opt/bot/csv", limit=7, session_name="session_master"
     )
     if not csv_files:
         await send_error_async("CSV файлы не найдены в канале 1")
@@ -1193,7 +1193,7 @@ async def task_channel2() -> List[str]:
 
     csv_files = await download_csv_from_channel(
         CHANNEL_NAME_2, "/opt/bot/csv2", limit=7,
-        only_last_n=2, session_name="session_ch2"
+        only_last_n=2, session_name="session_master"
     )
     if not csv_files:
         await send_error_async("CSV файлы не найдены в канале 2")
@@ -1302,7 +1302,7 @@ async def run_test():
     os.makedirs("/opt/bot/csv_test", exist_ok=True)
 
     proxy_kwargs = _telethon_proxy() or {}
-    client = TelegramClient("session_test", API_ID, API_HASH, **proxy_kwargs)
+    client = TelegramClient("session_master", API_ID, API_HASH, **proxy_kwargs)
     await client.start(PHONE)
 
     test_csv = None
