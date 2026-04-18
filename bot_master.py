@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bot_master.py v4.9
+bot_master.py v4.91
 ──────────────────
 Изменения:
   • Два TG-канала с независимыми окнами скачивания (UTC+4):
@@ -46,7 +46,13 @@ load_dotenv()
 # ══════════════════════════════════════════════════════════════════════════════
 # Запуск: python bot_master.py --test  ИЛИ  BOT_MASTER_TEST_MODE=1
 import sys
-TEST_MODE = "--test" in sys.argv or os.getenv("BOT_MASTER_TEST_MODE", "") == "1"
+TEST_MODE   = "--test" in sys.argv or os.getenv("BOT_MASTER_TEST_MODE", "") == "1"
+
+# Ручной режим (запуск с сайта): сразу без ожидания временных окон
+MANUAL_MODE = os.getenv("BOT_MANUAL_MODE", "0") == "1"
+MANUAL_CH1  = os.getenv("BOT_DO_CHANNEL1",  "1") == "1"
+MANUAL_CH2  = os.getenv("BOT_DO_CHANNEL2",  "1") == "1"
+MANUAL_VK   = os.getenv("BOT_DO_VK_UPLOAD", "1") == "1"
 
 if TEST_MODE:
     print("🧪 ТЕСТ-РЕЖИМ: скачиваем 1 файл → test.txt → загружаем в 1 кабинет")
@@ -1512,13 +1518,16 @@ async def main():
     # 1) leads_sub6 за вчера
     leads_sub6_path = await process_previous_day_file()
 
-    # 2) Параллельно скачиваем из обоих каналов
-    # Канал 1 и канал 2 — независимые временны́е окна
-    logger.info("Запускаем задачи скачивания для обоих каналов параллельно")
-    ch1_task = asyncio.create_task(task_channel1())
-    ch2_task = asyncio.create_task(task_channel2())
-
-    txt_files_ch1, txt_files_ch2 = await asyncio.gather(ch1_task, ch2_task)
+    # 2) Скачивание из каналов
+    if MANUAL_MODE:
+        logger.info("🖱 Ручной режим: ch1=%s ch2=%s vk=%s", MANUAL_CH1, MANUAL_CH2, MANUAL_VK)
+        txt_files_ch1 = await task_channel1() if MANUAL_CH1 else []
+        txt_files_ch2 = await task_channel2() if MANUAL_CH2 else []
+    else:
+        logger.info("⏰ Авто-режим: канал 1 сразу, канал 2 ждёт 05:02 UTC")
+        ch1_task = asyncio.create_task(task_channel1())
+        ch2_task = asyncio.create_task(task_channel2())
+        txt_files_ch1, txt_files_ch2 = await asyncio.gather(ch1_task, ch2_task)
 
     # 3) Объединяем все TXT
     all_txt_files = list(txt_files_ch1) + list(txt_files_ch2)
@@ -1557,16 +1566,20 @@ async def main():
                 logger.exception("Ошибка отправки в TG")
                 await send_error_async(f"TG отправка {path}: {e}")
 
-    # 8) Загружаем в VK по расписанию из портала
-    if VK_UPLOAD:
+    # 8) Загружаем в VK
+    do_vk = MANUAL_VK if MANUAL_MODE else VK_UPLOAD
+    if do_vk:
         cabinets = load_cabinets()
         if not cabinets:
             logger.warning("Кабинеты не загружены из портала, VK выгрузка пропущена")
         else:
             logger.info("Загружено %d кабинетов из портала", len(cabinets))
-            # Планировщик — каждый файл/кабинет загружается в своё время
-            # Параллельный запуск — asyncio.gather внутри
-            await vk_upload_scheduler(cabinets, files_pipeline)
+            if MANUAL_MODE:
+                logger.info("🖱 Ручная VK выгрузка (без расписания)")
+                for path in files_pipeline:
+                    await upload_file_to_cabinets(path, cabinets)
+            else:
+                await vk_upload_scheduler(cabinets, files_pipeline)
 
     # 9) Удаляем new_subs
     try:
