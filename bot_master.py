@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bot_master.py v4.91
+bot_master.py v4.92
 ──────────────────
 Изменения:
   • Два TG-канала с независимыми окнами скачивания (UTC+4):
@@ -56,12 +56,6 @@ MANUAL_VK   = os.getenv("BOT_DO_VK_UPLOAD", "1") == "1"
 
 if TEST_MODE:
     print("🧪 ТЕСТ-РЕЖИМ: скачиваем 1 файл → test.txt → загружаем в 1 кабинет")
-    logging.basicConfig(
-        stream=sys.stdout,
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        force=True,
-    )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # === ПРОКСИ ДЛЯ TELEGRAM — МНОГОУРОВНЕВЫЙ FAILOVER ===========================
@@ -415,11 +409,26 @@ CHANNEL2_WINDOW_END   = (5, 6)
 # ══════════════════════════════════════════════════════════════════════════════
 # === ЛОГИРОВАНИЕ ==============================================================
 # ══════════════════════════════════════════════════════════════════════════════
-logging.basicConfig(
-    filename="/opt/bot/bot_master.log",
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+LOG_FILE = os.getenv("BOT_LOG_PATH", "/opt/bot/bot_master.log")
+LOG_FMT  = "%(asctime)s [%(levelname)s] %(message)s"
+
+_root = logging.getLogger()
+_root.setLevel(logging.INFO)
+_root.handlers.clear()  # убираем хендлеры от basicConfig если уже были
+
+# Файл — всегда
+try:
+    _fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    _fh.setFormatter(logging.Formatter(LOG_FMT))
+    _root.addHandler(_fh)
+except Exception as _e:
+    print(f"[WARN] Не удалось открыть лог {LOG_FILE}: {_e}")
+
+# stdout — всегда (Node.js перехватывает при spawn, systemd пишет в journal)
+_sh = logging.StreamHandler(sys.stdout)
+_sh.setFormatter(logging.Formatter(LOG_FMT))
+_root.addHandler(_sh)
+
 logger = logging.getLogger("bot_master")
 
 # ══════════════════════════════════════════════════════════════════════════════
