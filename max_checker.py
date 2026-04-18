@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 load_dotenv("/opt/bot/.env")
 
-VERSION_MAX_CHECKER = "1.35"
+VERSION_MAX_CHECKER = "1.36"
 
 # === Настройки ===
 PROMO_CHECKER_KEY = os.getenv("PROMO_CHECKER_KEY", "")
@@ -208,27 +208,29 @@ def collect_phones_from_txt_files() -> Tuple[Set[str], Set[str]]:
 ALREADY_CHECKED_MAX_LINES = 200000  # Максимум строк в одном файле
 
 
+def get_today_already_checked_file() -> str:
+    """Возвращает путь к файлу already_checked за сегодня."""
+    date_str = datetime.today().strftime("%d_%m_%Y")
+    return os.path.join(TXTS_DIR, f"already_checked_{date_str}.txt")
+
+
 def get_already_checked_files() -> List[str]:
-    """Возвращает список всех файлов already_checked в правильном порядке"""
+    """Возвращает все файлы already_checked (по дням + старый формат) в хронологическом порядке."""
     if not os.path.exists(TXTS_DIR):
         return []
-    
     files = []
-    # Основной файл
-    main_file = os.path.join(TXTS_DIR, "already_checked.txt")
-    if os.path.exists(main_file):
-        files.append(main_file)
-    
-    # Дополнительные файлы already_checked_1.txt, already_checked_2.txt, ...
-    i = 1
-    while True:
-        numbered_file = os.path.join(TXTS_DIR, f"already_checked_{i}.txt")
-        if os.path.exists(numbered_file):
-            files.append(numbered_file)
-            i += 1
-        else:
-            break
-    
+    # Старый формат (для обратной совместимости)
+    old_main = os.path.join(TXTS_DIR, "already_checked.txt")
+    if os.path.exists(old_main):
+        files.append(old_main)
+    # Новый формат: already_checked_DD_MM_YYYY.txt
+    import glob as _glob
+    daily = sorted(_glob.glob(os.path.join(TXTS_DIR, "already_checked_*.txt")))
+    for f in daily:
+        import re as _re
+        if _re.search(r'already_checked_\d{2}_\d{2}_\d{4}\.txt$', f):
+            if f not in files:
+                files.append(f)
     return files
 
 
@@ -296,62 +298,20 @@ def get_last_already_checked_file() -> Tuple[str, int]:
         return last_file, 0
 
 
-def save_already_checked(phones: Set[str]):
-    """
-    Добавляет номера в файлы already_checked.
-    Разбивает на файлы по ALREADY_CHECKED_MAX_LINES строк.
-    """
-    if not phones:
-        return
-    
+def save_already_checked(phones: set):
+    """Сохраняет номера в файл already_checked за сегодня (по дням)."""
     os.makedirs(TXTS_DIR, exist_ok=True)
-    phones_list = list(phones)
-    
-    try:
-        last_file, current_count = get_last_already_checked_file()
-        
-        idx = 0
-        while idx < len(phones_list):
-            # Сколько можно добавить в текущий файл
-            space_left = ALREADY_CHECKED_MAX_LINES - current_count
-            
-            if space_left <= 0:
-                # Текущий файл заполнен, создаём новый
-                files = get_already_checked_files()
-                if not files or files[-1] == os.path.join(TXTS_DIR, "already_checked.txt"):
-                    new_file_num = 1
-                else:
-                    # Извлекаем номер из последнего файла
-                    last_name = os.path.basename(files[-1])
-                    # already_checked_N.txt -> N
-                    try:
-                        new_file_num = int(last_name.replace("already_checked_", "").replace(".txt", "")) + 1
-                    except ValueError:
-                        new_file_num = 1
-                
-                last_file = os.path.join(TXTS_DIR, f"already_checked_{new_file_num}.txt")
-                current_count = 0
-                space_left = ALREADY_CHECKED_MAX_LINES
-                logger.info(f"Создаётся новый файл: {last_file}")
-            
-            # Добавляем номера в текущий файл
-            to_add = phones_list[idx:idx + space_left]
-            
-            with open(last_file, "a", encoding="utf-8") as f:
-                for phone in to_add:
-                    f.write(phone + "\n")
-            
-            logger.info(f"Добавлено {len(to_add)} номеров в {os.path.basename(last_file)}")
-            
-            idx += len(to_add)
-            current_count += len(to_add)
-        
-        logger.info(f"Всего сохранено {len(phones_list)} новых номеров в already_checked")
-        
-    except Exception as e:
-        logger.exception(f"Ошибка при сохранении already_checked: {e}")
-
-
+    filepath = get_today_already_checked_file()
+    # Дозаписываем (append) чтобы не затирать предыдущие записи за сегодня
+    existing = set()
+    if os.path.exists(filepath):
+        with open(filepath, "r", encoding="utf-8") as f:
+            existing = {l.strip() for l in f if l.strip()}
+    new_phones = phones - existing
+    if new_phones:
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write('\n'.join(sorted(new_phones)) + '\n')
+    logger.info(f"already_checked ({datetime.today().strftime('%d.%m.%Y')}): +{len(new_phones)} новых, всего {len(existing)+len(new_phones)}")
 def prepare_pack_file(
     pack_name: str,
     all_phones: Set[str],
@@ -733,7 +693,7 @@ async def submit_order(
 
     order_id = send_order(file_path, service_type=19, force=1)
     if order_id is None:
-        await send_telegram_message(f"❌ [{pack_name}] Не удалось создать заказ")
+        # TG отправка отключена
         return None
 
     logger.info(f"[{pack_name}] Заказ {order_id} отправлен успешно")
@@ -765,23 +725,23 @@ async def collect_and_send_result(
     if "error" in result:
         error_msg = result.get("error", "Unknown error")
         if "Insufficient funds" in str(error_msg):
-            await send_telegram_message(f"⚠️ [{pack_name}] Недостаточно средств — результат недоступен")
+            pass
         else:
-            await send_telegram_message(f"❌ [{pack_name}] Ошибка ожидания: {error_msg}")
+            pass
         return
 
     result_url = result.get("result")
     cost = result.get("cost", "0")
 
     if not result_url:
-        await send_telegram_message(f"❌ [{pack_name}] Не получен URL результата")
+        # TG отправка отключена
         return
 
     original_filename = result_url.split("/")[-1]
     downloaded_path = os.path.join(RESULTS_DIR, original_filename)
 
     if not download_result(result_url, downloaded_path):
-        await send_telegram_message(f"❌ [{pack_name}] Не удалось скачать результат")
+        # TG отправка отключена
         return
 
     if not result_filename:
@@ -803,8 +763,8 @@ async def collect_and_send_result(
         f"🧾Строк: {filtered_count:,} (активных ≤{MAX_ACTIVE_DAYS_AGO}д из {total_from_api:,})".replace(",", ".")
     )
 
-    await send_telegram_message(message)
-    await send_telegram_file(final_path, custom_filename=result_filename)
+    # TG отправка отключена
+    # TG отправка отключена
 
     logger.info(f"[{pack_name}] Завершено: {filtered_count} активных ID из {total_from_api}")
 
@@ -904,9 +864,7 @@ async def run_max_checker():
             if file_path and lines_count > 0:
                 save_already_checked(set(phones_ac))
                 logger.info(f"[{pack_name}] Записано в already_checked: {lines_count} номеров")
-                await send_telegram_message(f"📦 [{pack_name}] Готов файл: {lines_count} номеров (без Promouser)")
-                await send_telegram_file(file_path, custom_filename=tg_filename)
-                logger.info(f"[{pack_name}] Файл отправлен в ТГ напрямую: {file_path}")
+                logger.info(f"[{pack_name}] Готов файл: {lines_count} номеров → {file_path}")
             else:
                 logger.info(f"[{pack_name}] Нет номеров для отправки")
         logger.info("=== max_checker завершён (без Promouser) ===")
