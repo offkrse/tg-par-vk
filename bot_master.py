@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bot_master.py v4.92
+bot_master.py v4.93
 ──────────────────
 Изменения:
   • Два TG-канала с независимыми окнами скачивания (UTC+4):
@@ -1550,10 +1550,23 @@ async def main():
 
     # 6) max_checker (опционально)
     checker_task = None
-    if PROMOUSER_UPLOAD and MAX_CHECKER_AVAILABLE:
+    run_max = (MANUAL_MAX_CHECKER if MANUAL_MODE else PROMOUSER_UPLOAD)
+    if run_max and MAX_CHECKER_AVAILABLE:
         try:
+            # Перед запуском MAX — удаляем из /opt/bot/txt/ файлы не за сегодня
+            today_num  = get_day_number(datetime.today())
+            today_mark = f"({today_num})"
+            txt_dir    = "/opt/bot/txt"
+            if os.path.exists(txt_dir):
+                for fname in os.listdir(txt_dir):
+                    if fname.endswith(".txt") and today_mark not in fname:
+                        try:
+                            os.remove(os.path.join(txt_dir, fname))
+                            logger.info("🗑️ Убран из MAX (не сегодня): %s", fname)
+                        except Exception:
+                            pass
             checker_task = start_checker_task()
-            logger.info("🔍 max_checker запущен")
+            logger.info("🔍 max_checker запущен (только %s)", today_mark)
         except Exception as e:
             logger.exception("Ошибка max_checker")
             await send_error_async(f"Ошибка max_checker: {e}")
