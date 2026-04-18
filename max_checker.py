@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 load_dotenv("/opt/bot/.env")
 
-VERSION_MAX_CHECKER = "1.34"
+VERSION_MAX_CHECKER = "1.35"
 
 # === Настройки ===
 PROMO_CHECKER_KEY = os.getenv("PROMO_CHECKER_KEY", "")
@@ -885,7 +885,9 @@ async def run_max_checker():
 
     balance_before = check_balance() or 0.0
 
+    logger.info(f"=== max_checker v{VERSION_MAX_CHECKER} ===")
     logger.info(f"Активные паки: {ALLOWED_PACKS}, SEND_TO_PROMOUSER={SEND_TO_PROMOUSER}")
+    logger.info(f"SOCKS5 прокси: {_TG_SOCKS5_HOST}:{_TG_SOCKS5_PORT}" if _TG_SOCKS5_HOST else "SOCKS5 прокси: не настроен")
 
     if not SEND_TO_PROMOUSER:
         # ── Режим прямой отправки в ТГ (без Promouser) ──────────────────────
