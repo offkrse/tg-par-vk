@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bot_master.py v4.94
+bot_master.py v4.95
 ──────────────────
 Изменения:
   • Два TG-канала с независимыми окнами скачивания (UTC+4):
@@ -1581,14 +1581,8 @@ async def main():
         files_pipeline.append(leads_sub6_path)
     files_pipeline.extend(txt_files_ordered)
 
-    # 7) Отправляем все файлы в Telegram
-    if SEND_FILES_TO_TELEGRAM:
-        for path in files_pipeline:
-            try:
-                await send_file_to_telegram(path)
-            except Exception as e:
-                logger.exception("Ошибка отправки в TG")
-                await send_error_async(f"TG отправка {path}: {e}")
+    # 7) Отправка в Telegram — отключена (файлы доступны через портал)
+    # if SEND_FILES_TO_TELEGRAM: ...
 
     # 8) Загружаем в VK
     do_vk = MANUAL_VK if MANUAL_MODE else VK_UPLOAD
