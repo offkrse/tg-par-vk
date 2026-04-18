@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 load_dotenv("/opt/bot/.env")
 
-VERSION_MAX_CHECKER = "1.33"
+VERSION_MAX_CHECKER = "1.34"
 
 # === Настройки ===
 PROMO_CHECKER_KEY = os.getenv("PROMO_CHECKER_KEY", "")
@@ -52,8 +52,12 @@ ALLOWED_PACKS: List[str] = ["pack1","pack2"]
 SEND_TO_PROMOUSER: bool = False
 
 # === Прокси для Telegram ===
-_TG_PROXY_URL = os.getenv("TG_PROXY_URL", "").rstrip("/")
+_TG_PROXY_URL    = os.getenv("TG_PROXY_URL", "").rstrip("/")
 _TG_PROXY_SECRET = os.getenv("TG_PROXY_SECRET", "")
+_TG_SOCKS5_HOST  = os.getenv("TG_SOCKS5_HOST", "")
+_TG_SOCKS5_PORT  = int(os.getenv("TG_SOCKS5_PORT", "1080"))
+_TG_SOCKS5_USER  = os.getenv("TG_SOCKS5_USER", "")
+_TG_SOCKS5_PASS  = os.getenv("TG_SOCKS5_PASS", "")
 
 
 def _bot_api_url(token: str, method: str) -> str:
@@ -66,6 +70,29 @@ def _proxy_headers() -> dict:
     if _TG_PROXY_SECRET:
         return {"X-Proxy-Secret": _TG_PROXY_SECRET}
     return {}
+
+
+def _aiohttp_connector():
+    """SOCKS5 коннектор для aiohttp — использует те же настройки что bot_master."""
+    if not _TG_SOCKS5_HOST:
+        return None
+    try:
+        from aiohttp_socks import ProxyConnector, ProxyType
+        if _TG_SOCKS5_USER:
+            return ProxyConnector(
+                proxy_type=ProxyType.SOCKS5,
+                host=_TG_SOCKS5_HOST, port=_TG_SOCKS5_PORT,
+                username=_TG_SOCKS5_USER, password=_TG_SOCKS5_PASS,
+                rdns=True,
+            )
+        return ProxyConnector(
+            proxy_type=ProxyType.SOCKS5,
+            host=_TG_SOCKS5_HOST, port=_TG_SOCKS5_PORT,
+            rdns=True,
+        )
+    except ImportError:
+        logging.warning("aiohttp-socks не установлен, SOCKS5 недоступен")
+        return None
 
 def get_usd_rub_rate() -> float:
     """Получает текущий курс USD/RUB"""
@@ -575,8 +602,9 @@ async def send_telegram_message(text: str, chat_id: str = CHECKER_CHAT_ID):
         return
 
     url = _bot_api_url(BOT_TOKEN, "sendMessage")
+    connector = _aiohttp_connector()
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(connector=connector) as session:
             async with session.post(
                 url,
                 data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
@@ -596,8 +624,9 @@ async def send_telegram_file(file_path: str, caption: str = "", chat_id: str = C
         return
 
     url = _bot_api_url(BOT_TOKEN, "sendDocument")
+    connector = _aiohttp_connector()
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(connector=connector) as session:
             with open(file_path, "rb") as f:
                 form = aiohttp.FormData()
                 form.add_field("chat_id", chat_id)
