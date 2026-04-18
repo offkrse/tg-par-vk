@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bot_master.py v4.8
+bot_master.py v4.9
 ──────────────────
 Изменения:
   • Два TG-канала с независимыми окнами скачивания (UTC+4):
@@ -1158,15 +1158,7 @@ async def task_channel1() -> List[str]:
     затем скачивает CSV из канала 1, обрабатывает, загружает в S3.
     Возвращает список txt-файлов.
     """
-    # Рандомная задержка внутри окна
-    start_h, start_m = CHANNEL1_WINDOW_START
-    end_h,   end_m   = CHANNEL1_WINDOW_END
-    delay = seconds_until_window(start_h, start_m)
-    jitter = random.uniform(0, (end_m - start_m) * 60)  # случайно внутри окна
-    wait = delay + jitter
-    logger.info("Канал 1: ждём %.0f мин до скачивания", wait / 60)
-    await asyncio.sleep(wait)
-
+    # Таймер запускает бота уже в нужное время — сразу качаем
     if not CHANNEL_NAME:
         logger.warning("CHANNEL_NAME не задан, пропускаем канал 1")
         return []
@@ -1199,13 +1191,15 @@ async def task_channel2() -> List[str]:
     Ждёт окна 09:02–09:06 UTC+4 (05:02–05:06 UTC),
     затем скачивает последние 2 CSV из канала 2, обрабатывает, загружает в S3.
     """
-    start_h, start_m = CHANNEL2_WINDOW_START
-    end_h,   end_m   = CHANNEL2_WINDOW_END
-    delay  = seconds_until_window(start_h, start_m)
-    jitter = random.uniform(0, (end_m - start_m) * 60)
-    wait   = delay + jitter
-    logger.info("Канал 2: ждём %.0f мин до скачивания", wait / 60)
-    await asyncio.sleep(wait)
+    if not MANUAL_MODE:
+        # Авто: ждём окно 05:02–05:06 UTC (09:02–09:06 UTC+4)
+        start_h, start_m = CHANNEL2_WINDOW_START
+        end_h,   end_m   = CHANNEL2_WINDOW_END
+        delay  = seconds_until_window(start_h, start_m)
+        jitter = random.uniform(0, (end_m - start_m) * 60)
+        wait   = delay + jitter
+        logger.info("Канал 2: ждём %.0f мин до скачивания (05:02–05:06 UTC)", wait / 60)
+        await asyncio.sleep(wait)
 
     if not CHANNEL_NAME_2:
         logger.info("CHANNEL_NAME_2 не задан, пропускаем канал 2")
