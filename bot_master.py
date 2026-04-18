@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bot_master.py v4.93
+bot_master.py v4.94
 ──────────────────
 Изменения:
   • Два TG-канала с независимыми окнами скачивания (UTC+4):
@@ -52,7 +52,9 @@ TEST_MODE   = "--test" in sys.argv or os.getenv("BOT_MASTER_TEST_MODE", "") == "
 MANUAL_MODE = os.getenv("BOT_MANUAL_MODE", "0") == "1"
 MANUAL_CH1  = os.getenv("BOT_DO_CHANNEL1",  "1") == "1"
 MANUAL_CH2  = os.getenv("BOT_DO_CHANNEL2",  "1") == "1"
-MANUAL_VK   = os.getenv("BOT_DO_VK_UPLOAD", "1") == "1"
+MANUAL_VK          = os.getenv("BOT_DO_VK_UPLOAD",      "1") == "1"
+MANUAL_MAX_CHECKER = os.getenv("BOT_DO_MAX_CHECKER",    "0") == "1"
+MANUAL_CABINETS    = [c.strip() for c in os.getenv("BOT_SELECTED_CABINETS", "").split(",") if c.strip()]
 
 if TEST_MODE:
     print("🧪 ТЕСТ-РЕЖИМ: скачиваем 1 файл → test.txt → загружаем в 1 кабинет")
