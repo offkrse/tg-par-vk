@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 load_dotenv("/opt/bot/.env")
 
-VERSION_MAX_CHECKER = "1.36"
+VERSION_MAX_CHECKER = "1.37"
 
 # === Настройки ===
 PROMO_CHECKER_KEY = os.getenv("PROMO_CHECKER_KEY", "")
