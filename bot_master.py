@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bot_master.py v4.95
+bot_master.py v4.96
 ──────────────────
 Изменения:
   • Два TG-канала с независимыми окнами скачивания (UTC+4):
@@ -1093,6 +1093,8 @@ async def vk_upload_scheduler(cabinets: List[dict], txt_files: List[str]):
             minute = sched.get("minute", sched.get("time", "08:00").split(":")[1] if "time" in sched else 0)
             hour   = int(hour)
             minute = int(minute)
+            # Пользователь задаёт время в UTC+4, seconds_until_window работает с UTC
+            hour = (hour - 4) % 24
 
             # Найти файл для этой базы в txt_files
             matching = [
@@ -1109,8 +1111,8 @@ async def vk_upload_scheduler(cabinets: List[dict], txt_files: List[str]):
             async def scheduled_upload(cab=cabinet, path=file_path, h=hour, m=minute, bname=base_name):
                 delay = seconds_until_window(h, m)
                 logger.info(
-                    "⏰ Кабинет «%s» файл «%s» — выгрузка через %.0f мин (%02d:%02d UTC)",
-                    cab.get("name"), bname, delay / 60, h, m
+                    "⏰ Кабинет «%s» файл «%s» — выгрузка через %.0f мин (%02d:%02d UTC = %02d:%02d UTC+4)",
+                    cab.get("name"), bname, delay / 60, h, m, (h + 4) % 24, m
                 )
                 await asyncio.sleep(delay)
                 try:
