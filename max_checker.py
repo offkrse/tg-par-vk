@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 load_dotenv("/opt/bot/.env")
 
-VERSION_MAX_CHECKER = "1.37"
+VERSION_MAX_CHECKER = "1.38"
 
 # === Настройки ===
 PROMO_CHECKER_KEY = os.getenv("PROMO_CHECKER_KEY", "")
@@ -45,7 +45,7 @@ MAX_ACTIVE_DAYS_AGO = 20
 #   ALLOWED_PACKS = ["pack1", "pack2"]  — запустить оба пака
 #   ALLOWED_PACKS = ["pack1"]           — только pack1
 #   ALLOWED_PACKS = ["pack2"]           — только pack2
-ALLOWED_PACKS: List[str] = ["pack1","pack2"]
+ALLOWED_PACKS: List[str] = ["pack1","pack2","pack3"]
 
 # Если True  — паки отправляются в Promouser для проверки, результат приходит в ТГ.
 # Если False — паки НЕ отправляются в Promouser, файлы отправляются сразу в ТГ.
@@ -198,6 +198,19 @@ def collect_phones_pack2() -> Tuple[Set[str], Set[str]]:
     Приоритет — ББ ДОП_2 (идёт первым).
     """
     return collect_phones_by_prefixes(PACK2_PREFIXES, priority_prefix="ББ ДОП_2")
+
+
+# --- Pack 3: КБ21 ---
+PACK3_PREFIXES: Tuple[str, ...] = (
+    "КБ21",
+)
+
+
+def collect_phones_pack3() -> Tuple[Set[str], Set[str]]:
+    """Возвращает (all_phones, priority_phones) для pack3.
+    Приоритет — КБ21 (единственный префикс).
+    """
+    return collect_phones_by_prefixes(PACK3_PREFIXES, priority_prefix="КБ21")
 
 
 # Оставляем старое имя как алиас для обратной совместимости
@@ -381,6 +394,12 @@ def create_non_check_files_pack2() -> Tuple[Optional[str], int, List[str]]:
     """Pack2 (ББ ДОП_2, ББ ДОП_3, КР 1..9). Возвращает (путь, кол-во, phones_for_ac)."""
     all_phones, priority_phones = collect_phones_pack2()
     return prepare_pack_file("pack2", all_phones, priority_phones)
+
+
+def create_non_check_files_pack3() -> Tuple[Optional[str], int, List[str]]:
+    """Pack3 (КБ21). Возвращает (путь, кол-во, phones_for_ac)."""
+    all_phones, priority_phones = collect_phones_pack3()
+    return prepare_pack_file("pack3", all_phones, priority_phones)
 
 
 # === API функции ===
@@ -833,7 +852,10 @@ async def run_max_checker():
       3. Подготовить файл pack2 (ББ ДОП_2/3, КР 1..КР ДОП_9).
       4. Загрузить pack2 в promouser → получить order_id2.
          Сразу после успешной загрузки записать номера pack2 в already_checked.
-      5. Ждать готовности pack1 и pack2 параллельно (asyncio.gather).
+      5. Подготовить файл pack3 (КБ21).
+      6. Загрузить pack3 в promouser → получить order_id3.
+         Сразу после успешной загрузки записать номера pack3 в already_checked.
+      7. Ждать готовности pack1, pack2 и pack3 параллельно (asyncio.gather).
          Как только каждый готов — сразу отправлять результат в ТГ.
     """
     logger.info("=== Запуск max_checker ===")
@@ -855,6 +877,7 @@ async def run_max_checker():
         for pack_name, create_fn, tg_filename in [
             ("pack1", create_non_check_files,       f"1max_ids_pack1_{date_str}.txt"),
             ("pack2", create_non_check_files_pack2, f"2max_ids_pack2_{date_str}.txt"),
+            ("pack3", create_non_check_files_pack3, f"3max_ids_pack3_{date_str}.txt"),
         ]:
             if pack_name not in ALLOWED_PACKS:
                 logger.info(f"[{pack_name}] Пропущен (не в ALLOWED_PACKS)")
@@ -897,7 +920,20 @@ async def run_max_checker():
     else:
         logger.info("[pack2] Пропущен (не в ALLOWED_PACKS)")
 
-    # ── Шаг 3: параллельное ожидание и отправка результатов в ТГ ────────────
+    # ── Шаг 3: подготовка и загрузка pack3 ──────────────────────────────────
+    order_id3: Optional[int] = None
+    lines_count3: int = 0
+    if "pack3" in ALLOWED_PACKS:
+        logger.info("[pack3] Подготовка файла...")
+        file_path3, lines_count3, phones_ac3 = create_non_check_files_pack3()
+        if file_path3 and lines_count3 > 0:
+            order_id3 = await submit_order(file_path3, phones_ac3, "pack3")
+        else:
+            logger.info("[pack3] Нет номеров для проверки")
+    else:
+        logger.info("[pack3] Пропущен (не в ALLOWED_PACKS)")
+
+    # ── Шаг 4: параллельное ожидание и отправка результатов в ТГ ────────────
     # Каждый pack отправляется в ТГ как только готов, независимо от другого
     tasks = []
     if order_id1 is not None:
@@ -909,6 +945,11 @@ async def run_max_checker():
         tasks.append(collect_and_send_result(
             order_id2, lines_count2, "pack2",
             f"2max_ids_pack2_{date_str}.txt", balance_before,
+        ))
+    if order_id3 is not None:
+        tasks.append(collect_and_send_result(
+            order_id3, lines_count3, "pack3",
+            f"3max_ids_pack3_{date_str}.txt", balance_before,
         ))
 
     if tasks:
